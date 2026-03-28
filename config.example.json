@@ -1,0 +1,32 @@
+{
+  "sip": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 5060,
+    "external_ip": "YOUR_PUBLIC_IP",
+    "external_port": 5060,
+    "rtp_port_min": 10000,
+    "rtp_port_max": 10200
+  },
+  "uplink": {
+    "host": "sip.provider.com",
+    "port": 5060,
+    "username": "your_sip_username",
+    "password": "your_sip_password",
+    "expiry": 300
+  },
+  "users": [
+    { "username": "100", "password": "changeme100" },
+    { "username": "101", "password": "changeme101" },
+    { "username": "102", "password": "changeme102" }
+  ],
+  "dialplan": {
+    "internal_max_digits": 3
+  },
+  "recording": {
+    "enabled": true,
+    "dir": "./recordings"
+  },
+  "post_call": {
+    "script": ""
+  }
+}
