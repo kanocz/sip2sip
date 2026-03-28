@@ -45,6 +45,7 @@ Edit `config.json`:
 | `dialplan.internal_max_digits` | Max digits for an internal number (default `3`) |
 | `recording.enabled` | Enable call recording (`true`/`false`) |
 | `recording.dir` | Directory for WAV and JSON files |
+| `recording.announcement` | WAV file to play before recording starts (EU compliance, optional) |
 | `post_call.script` | Path to the post-call script (optional) |
 
 ## Port Forwarding (NAT)
@@ -76,7 +77,8 @@ Make sure `sip.external_ip` in the config points to your public IP.
 2. When a call arrives, all registered local phones ring simultaneously
 3. The first phone to answer gets the call
 4. Audio is bridged between the caller and the answering phone
-5. If recording is enabled, a stereo WAV file is created
+5. If `recording.announcement` is set, the WAV file is played to both parties (EU recording notification)
+6. If recording is enabled, a stereo WAV file is created
 6. After hangup, a CDR (JSON) is saved and the post-call script is executed
 
 ### Outgoing calls
@@ -148,4 +150,5 @@ G.711 (PCMU/PCMA) is supported. The codec is negotiated automatically between th
 - **Uplink registration**: custom implementation with manual digest auth for full control
 - **Local registrar**: digest authentication (MD5, qop=auth)
 - **Call handling**: diago library for media bridging and SDP negotiation
+- **Announcement**: optional WAV playback to both parties before recording (EU compliance)
 - **Recording**: stereo WAV via diago's `AudioStereoRecordingCreate`

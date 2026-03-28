@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/diago"
@@ -290,6 +291,11 @@ func (h *CallHandler) bridgeWithRecording(inDialog *diago.DialogServerSession, o
 		}()
 	}
 
+	// Play announcement to both sides if configured (EU recording notification)
+	if h.cfg.Recording.Announcement != "" && h.cfg.Recording.Enabled {
+		h.playAnnouncement(inDialog, outDialog, log)
+	}
+
 	// Get audio readers/writers
 	aReader, err := inDialog.AudioReader()
 	if err != nil {
@@ -333,6 +339,73 @@ func (h *CallHandler) bridgeWithRecording(inDialog *diago.DialogServerSession, o
 	// Hang up the other side
 	outDialog.Hangup(context.Background())
 	inDialog.Hangup(context.Background())
+}
+
+// playAnnouncement plays a WAV file to both call parties simultaneously.
+// Used for EU-compliant recording notification.
+//
+// If recording is active, the announcement is captured in the recording:
+//   - Right channel (callee side): the announcement audio
+//   - Left channel (caller side): caller's ambient audio during announcement
+//
+// This works because recording wraps inDialog's reader/writer:
+//   - inDialog.PlaybackCreate() writes through the recording monitor → right channel
+//   - Draining inDialog.AudioReader() reads through the recording monitor → left channel
+func (h *CallHandler) playAnnouncement(inDialog *diago.DialogServerSession, outDialog *diago.DialogClientSession, log *slog.Logger) {
+	log.Info("Playing announcement", "file", h.cfg.Recording.Announcement)
+
+	pbCaller, err1 := inDialog.PlaybackCreate()
+	pbCallee, err2 := outDialog.PlaybackCreate()
+	if err1 != nil || err2 != nil {
+		log.Error("Failed to create playback for announcement", "err_in", err1, "err_out", err2)
+		return
+	}
+
+	// Drain caller's audio during announcement so it gets recorded on the left channel.
+	// Without draining, the recording-wrapped reader is never called and the left channel
+	// would be silent during the announcement.
+	var drainStop atomic.Bool
+	drainDone := make(chan struct{})
+	callerReader, err := inDialog.AudioReader()
+	if err == nil {
+		go func() {
+			defer close(drainDone)
+			buf := make([]byte, media.RTPBufSize)
+			for !drainStop.Load() {
+				if _, err := callerReader.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+	} else {
+		close(drainDone)
+	}
+
+	// Play to both sides simultaneously
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := pbCaller.PlayFile(h.cfg.Recording.Announcement); err != nil {
+			log.Error("Announcement playback failed (caller side)", "err", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := pbCallee.PlayFile(h.cfg.Recording.Announcement); err != nil {
+			log.Error("Announcement playback failed (callee side)", "err", err)
+		}
+	}()
+	wg.Wait()
+
+	// Stop drain and wait for it to exit before bridge takes over the reader
+	drainStop.Store(true)
+	select {
+	case <-drainDone:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	log.Debug("Announcement finished")
 }
 
 // setupRecording sets up stereo WAV recording on the incoming dialog.

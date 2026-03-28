@@ -24,7 +24,8 @@
   },
   "recording": {
     "enabled": true,
-    "dir": "./recordings"
+    "dir": "./recordings",
+    "announcement": "./announcement.wav"
   },
   "post_call": {
     "script": ""

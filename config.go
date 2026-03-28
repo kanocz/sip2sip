@@ -43,8 +43,9 @@ type DialplanConfig struct {
 }
 
 type RecordingConfig struct {
-	Enabled bool   `json:"enabled"`
-	Dir     string `json:"dir"`
+	Enabled      bool   `json:"enabled"`
+	Dir          string `json:"dir"`
+	Announcement string `json:"announcement"` // WAV file to play before recording (EU compliance)
 }
 
 type PostCallConfig struct {
