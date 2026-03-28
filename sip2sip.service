@@ -1,0 +1,21 @@
+[Unit]
+Description=sip2sip - minimal SIP B2BUA server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sip2sip
+ExecStart=/opt/sip2sip/sip2sip -config /opt/sip2sip/config.json
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sip2sip/recordings
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
