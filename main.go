@@ -24,7 +24,7 @@ func main() {
 		logLevel = slog.LevelDebug
 		sip.SIPDebug = true
 	}
-	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	log := slog.New(newFilterHandler(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 	// sipgo's SIPDebug uses sip.DefaultLogger() which falls back to slog.Default()
 	sip.SetDefaultLogger(log)
 	slog.SetDefault(log)

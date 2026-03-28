@@ -12,7 +12,9 @@
     "port": 5060,
     "username": "your_sip_username",
     "password": "your_sip_password",
-    "expiry": 300
+    "expiry": 300,
+    "filter_called_no": true,
+    "filter_source_ip": false
   },
   "users": [
     { "username": "100", "password": "changeme100" },
@@ -25,7 +27,8 @@
   "recording": {
     "enabled": true,
     "dir": "./recordings",
-    "announcement": "./announcement.wav"
+    "announcement": "./announcement.wav",
+    "answer_first": true
   },
   "post_call": {
     "script": ""

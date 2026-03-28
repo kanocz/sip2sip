@@ -26,11 +26,13 @@ type SIPConfig struct {
 }
 
 type UplinkConfig struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Expiry   int    `json:"expiry"` // seconds
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	Expiry         int    `json:"expiry"`            // seconds
+	FilterCalledNo bool   `json:"filter_called_no"`  // only accept calls to our registered number
+	FilterSourceIP bool   `json:"filter_source_ip"`  // only accept calls from uplink server IP
 }
 
 type UserConfig struct {
@@ -45,7 +47,8 @@ type DialplanConfig struct {
 type RecordingConfig struct {
 	Enabled      bool   `json:"enabled"`
 	Dir          string `json:"dir"`
-	Announcement string `json:"announcement"` // WAV file to play before recording (EU compliance)
+	Announcement string `json:"announcement"`  // WAV file to play before recording (EU compliance)
+	AnswerFirst  bool   `json:"answer_first"`  // answer caller before ringing phones (plays announcement first)
 }
 
 type PostCallConfig struct {
