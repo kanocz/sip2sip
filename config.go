@@ -8,12 +8,14 @@ import (
 )
 
 type Config struct {
-	SIP       SIPConfig       `json:"sip"`
-	Uplink    UplinkConfig    `json:"uplink"`
-	Users     []UserConfig    `json:"users"`
-	Dialplan  DialplanConfig  `json:"dialplan"`
-	Recording RecordingConfig `json:"recording"`
-	PostCall  PostCallConfig  `json:"post_call"`
+	SIP           SIPConfig           `json:"sip"`
+	Uplink        UplinkConfig        `json:"uplink"`
+	Users         []UserConfig        `json:"users"`
+	Dialplan      DialplanConfig      `json:"dialplan"`
+	Recording     RecordingConfig     `json:"recording"`
+	PostCall      PostCallConfig      `json:"post_call"`
+	Voicemail     VoicemailConfig     `json:"voicemail"`
+	BusinessHours BusinessHoursConfig `json:"business_hours"`
 }
 
 type SIPConfig struct {
@@ -55,6 +57,22 @@ type PostCallConfig struct {
 	Script string `json:"script"` // path to external script
 }
 
+type VoicemailConfig struct {
+	Enabled                 bool   `json:"enabled"`
+	UnavailableAnnouncement string `json:"unavailable_announcement"` // WAV file for "no agents available"
+	SilenceTimeout          int    `json:"silence_timeout"`          // seconds of silence to stop recording (default 10)
+	MaxDuration             int    `json:"max_duration"`             // max recording seconds (default 120)
+}
+
+type BusinessHoursConfig struct {
+	Enabled                  bool     `json:"enabled"`
+	Timezone                 string   `json:"timezone"`                   // IANA timezone (e.g. "Europe/Prague")
+	Days                     []string `json:"days"`                       // e.g. ["mon","tue","wed","thu","fri"]
+	StartTime                string   `json:"start_time"`                 // "HH:MM"
+	EndTime                  string   `json:"end_time"`                   // "HH:MM"
+	OutsideHoursAnnouncement string   `json:"outside_hours_announcement"` // WAV file for outside hours
+}
+
 func (c *UplinkConfig) ExpiryDuration() time.Duration {
 	if c.Expiry <= 0 {
 		return 300 * time.Second
@@ -77,6 +95,10 @@ func LoadConfig(path string) (*Config, error) {
 		},
 		Dialplan: DialplanConfig{
 			InternalMaxDigits: 3,
+		},
+		Voicemail: VoicemailConfig{
+			SilenceTimeout: 10,
+			MaxDuration:    120,
 		},
 	}
 

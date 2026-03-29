@@ -12,9 +12,13 @@ A minimal SIP B2BUA server written in Go, built on [diago](https://github.com/em
 - **Answer-first mode**: answer caller → play announcement → ringback → ring phones
 - **Call recording**: stereo WAV (left channel — one party, right channel — the other)
 - **Recording announcement**: EU-compliant notification played to both parties before recording
+- **Business hours**: accept calls only during configured days and hours
+- **Voicemail**: announcement + beep + recording when no operators available or outside business hours
+- **Hot reload**: `SIGHUP` / `systemctl reload` to apply config changes without restart
 - **Outgoing calls**: short numbers routed internally, longer numbers go through the uplink
 - **CDR**: JSON file with call details after each call
 - **Post-call script**: invokes an external script after each call
+- **TTS audio generation**: helper script to generate announcements via Google TTS
 - **Debug mode**: `--debug` flag enables full SIP message tracing
 
 ## Building
@@ -74,6 +78,56 @@ cp config.example.json config.json
 |---|---|---|
 | `post_call.script` | Script called after each call | — |
 
+### Voicemail
+
+When no operators are connected or the call is outside business hours, sip2sip can play an announcement and record a voicemail message.
+
+| Parameter | Description | Default |
+|---|---|---|
+| `voicemail.enabled` | Enable voicemail recording after announcement | `false` |
+| `voicemail.unavailable_announcement` | WAV file played when no operators are connected | — |
+| `voicemail.silence_timeout` | Seconds of silence before stopping recording | `10` |
+| `voicemail.max_duration` | Maximum recording duration in seconds | `120` |
+
+The voicemail flow: answer → play announcement → beep tone → record caller → stop on silence timeout or max duration. Voicemail recordings are saved to `recording.dir` as mono WAV (8kHz 16-bit PCM, G.711 decoded).
+
+If `voicemail.enabled` is `false` but an announcement is configured, only the announcement is played (no recording).
+
+The CDR JSON includes `"voicemail": true` and `"message_duration_seconds"` for voicemail calls, so post-call scripts can handle them accordingly.
+
+### Business hours
+
+| Parameter | Description | Default |
+|---|---|---|
+| `business_hours.enabled` | Enable business hours checking | `false` |
+| `business_hours.timezone` | IANA timezone (e.g. `Europe/Prague`) | `UTC` |
+| `business_hours.days` | Accepted days of week | — |
+| `business_hours.start_time` | Start time (`HH:MM`) | — |
+| `business_hours.end_time` | End time (`HH:MM`) | — |
+| `business_hours.outside_hours_announcement` | WAV file played outside business hours | — |
+
+Day names use 3-letter English abbreviations: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`.
+
+## Generating Audio Announcements
+
+Use the `tts.sh` helper to generate WAV files from text using Google Translate TTS:
+
+```bash
+# Requires: pip install gtts, ffmpeg
+./tts.sh <language> <output.wav> "<text>"
+
+# Examples:
+./tts.sh cs unavailable.wav "Dobrý den, momentálně nemůžeme váš hovor přijmout."
+./tts.sh en greeting.wav "Hello, please leave a message after the beep."
+./tts.sh de closed.wav "Guten Tag, wir sind derzeit nicht erreichbar."
+```
+
+Generate the default Czech announcements:
+
+```bash
+./generate_audio.sh
+```
+
 ## Port Forwarding (NAT)
 
 If the server is behind NAT, forward these ports:
@@ -100,7 +154,7 @@ Set `sip.external_ip` to your public IP.
 ```bash
 # Copy files
 sudo mkdir -p /opt/sip2sip/recordings
-sudo cp sip2sip announcement.wav /opt/sip2sip/
+sudo cp sip2sip announcement.wav unavailable.wav outside_hours.wav /opt/sip2sip/
 sudo cp config.example.json /opt/sip2sip/config.json
 sudo nano /opt/sip2sip/config.json  # edit config
 
@@ -112,7 +166,23 @@ sudo systemctl enable --now sip2sip
 # Check status / logs
 sudo systemctl status sip2sip
 sudo journalctl -u sip2sip -f
+
+# Reload config without restart (applies users, voicemail, business hours, recording, dialplan)
+sudo systemctl reload sip2sip
 ```
+
+### Config hot reload
+
+Sending `SIGHUP` (or `systemctl reload sip2sip`) reloads the configuration file without dropping active calls. The following settings are applied immediately:
+
+- User list (extensions, passwords)
+- Recording settings
+- Voicemail settings
+- Business hours schedule
+- Dialplan
+- Uplink call filters
+
+Settings that require a restart: SIP listen address/port, external IP/port, RTP port range, uplink host/credentials.
 
 ## How It Works
 
@@ -129,9 +199,11 @@ Both filters are independent and can be combined.
 
 1. sip2sip registers on the uplink SIP server
 2. Incoming INVITE is checked against configured filters
-3. All registered local phones ring simultaneously
-4. The first phone to answer gets the call
-5. Symmetric RTP (NAT traversal) is enabled — mobile clients behind carrier NAT work correctly
+3. Business hours are checked (if enabled) — outside hours → voicemail with `outside_hours_announcement`
+4. Registered phones are checked — if none connected → voicemail with `unavailable_announcement`
+5. All registered local phones ring simultaneously
+6. The first phone to answer gets the call
+7. Symmetric RTP (NAT traversal) is enabled — mobile clients behind carrier NAT work correctly
 
 **Normal mode** (`answer_first: false`):
 - Caller hears ringback from the uplink while phones ring
@@ -165,6 +237,7 @@ If recording is disabled or the call was not answered, `none` is passed instead 
 
 ### CDR Format (JSON)
 
+Regular call:
 ```json
 {
   "call_id": "a1b2c3d4",
@@ -178,8 +251,30 @@ If recording is disabled or the call was not answered, `none` is passed instead 
   "duration_seconds": 300,
   "talk_time_seconds": 295,
   "answered": true,
+  "voicemail": false,
   "hangup_by": "caller",
   "recording_file": "/opt/sip2sip/recordings/20260328_120000_a1b2c3d4.wav"
+}
+```
+
+Voicemail:
+```json
+{
+  "call_id": "b2c3d4e5",
+  "direction": "incoming",
+  "caller_number": "+420123456789",
+  "called_number": "100",
+  "answered_by": "voicemail",
+  "start_time": "2026-03-28T18:30:00Z",
+  "answer_time": "2026-03-28T18:30:01Z",
+  "end_time": "2026-03-28T18:30:35Z",
+  "duration_seconds": 35,
+  "talk_time_seconds": 34,
+  "answered": true,
+  "voicemail": true,
+  "message_duration_seconds": 12.5,
+  "hangup_by": "voicemail",
+  "recording_file": "/opt/sip2sip/recordings/vm_20260328_183000_b2c3d4e5.wav"
 }
 ```
 
@@ -215,3 +310,6 @@ G.711 (PCMU/PCMA) is supported. The codec is negotiated automatically between th
 - **NAT traversal**: symmetric RTP on all media legs
 - **Announcement**: WAV playback to both parties before recording (EU compliance)
 - **Recording**: stereo WAV via diago's `AudioStereoRecordingCreate`
+- **Voicemail**: announcement + beep + silence-detected recording
+- **Business hours**: timezone-aware day/time checking
+- **Hot reload**: atomic config swap on `SIGHUP`

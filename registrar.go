@@ -194,6 +194,26 @@ func (r *Registrar) GetRegistration(username string) *Registration {
 	return reg
 }
 
+// UpdateUsers replaces the user list (for config reload).
+func (r *Registrar) UpdateUsers(users []UserConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	newUsers := make(map[string]string, len(users))
+	for _, u := range users {
+		newUsers[u.Username] = u.Password
+	}
+	r.users = newUsers
+
+	// Remove registrations for deleted users
+	for username := range r.registrations {
+		if _, ok := newUsers[username]; !ok {
+			delete(r.registrations, username)
+			r.log.Info("Removed registration for deleted user", "user", username)
+		}
+	}
+}
+
 // IsLocalUser checks if username belongs to a registered local user.
 func (r *Registrar) IsLocalUser(username string) bool {
 	_, ok := r.users[username]

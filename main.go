@@ -132,11 +132,25 @@ func main() {
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		sig := <-sigCh
-		log.Info("Shutting down", "signal", sig)
-		cancel()
+		for sig := range sigCh {
+			if sig == syscall.SIGHUP {
+				log.Info("Reloading configuration", "signal", sig)
+				newCfg, err := LoadConfig(*configPath)
+				if err != nil {
+					log.Error("Failed to reload config", "err", err)
+					continue
+				}
+				handler.UpdateConfig(newCfg)
+				registrar.UpdateUsers(newCfg.Users)
+				log.Info("Configuration reloaded", "users", len(newCfg.Users))
+				continue
+			}
+			log.Info("Shutting down", "signal", sig)
+			cancel()
+			return
+		}
 	}()
 
 	// Start serving

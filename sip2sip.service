@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/sip2sip
 ExecStart=/opt/sip2sip/sip2sip -config /opt/sip2sip/config.json
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 

@@ -32,5 +32,19 @@
   },
   "post_call": {
     "script": ""
+  },
+  "voicemail": {
+    "enabled": true,
+    "unavailable_announcement": "./unavailable.wav",
+    "silence_timeout": 10,
+    "max_duration": 120
+  },
+  "business_hours": {
+    "enabled": true,
+    "timezone": "Europe/Prague",
+    "days": ["mon", "tue", "wed", "thu", "fri"],
+    "start_time": "10:00",
+    "end_time": "17:00",
+    "outside_hours_announcement": "./outside_hours.wav"
   }
 }

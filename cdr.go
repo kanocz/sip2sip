@@ -21,9 +21,11 @@ type CDR struct {
 	EndTime      time.Time `json:"end_time"`
 	Duration     float64   `json:"duration_seconds"`    // total duration from start
 	TalkTime     float64   `json:"talk_time_seconds"`   // time after answer
-	Answered     bool      `json:"answered"`
-	HangupBy     string    `json:"hangup_by"` // "caller", "callee", "timeout"
-	RecordingFile string   `json:"recording_file,omitempty"`
+	Answered        bool    `json:"answered"`
+	Voicemail       bool    `json:"voicemail"`
+	MessageDuration float64 `json:"message_duration_seconds,omitempty"` // voicemail message duration (after beep)
+	HangupBy        string  `json:"hangup_by"`                         // "caller", "callee", "timeout", "voicemail"
+	RecordingFile   string  `json:"recording_file,omitempty"`
 }
 
 func (c *CDR) ComputeDurations() {
