@@ -1,0 +1,10 @@
+# WhatsApp Cloud API access token
+# Get from: https://developers.facebook.com/apps → your app → WhatsApp → API Setup
+WHATSAPP_TOKEN="EAAxxxxxxx..."
+
+# Phone Number ID (not the phone number itself)
+# Get from the same API Setup page
+WHATSAPP_PHONE_ID="123456789012345"
+
+# Recipient phone number in international format (no + prefix)
+WHATSAPP_TO="420123456789"

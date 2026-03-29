@@ -1,0 +1,7 @@
+# Telegram Bot API token (from @BotFather)
+TELEGRAM_BOT_TOKEN="123456789:ABCdefGhIjKlMnOpQrStUvWxYz"
+
+# Chat ID to send notifications to.
+# Can be a user ID, group ID (-123456789), or channel (@channel_name).
+# To find your chat ID: message @userinfobot or @RawDataBot on Telegram.
+TELEGRAM_CHAT_ID="123456789"

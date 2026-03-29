@@ -278,6 +278,40 @@ Voicemail:
 }
 ```
 
+## Notification Helpers
+
+Ready-made post-call scripts in `helpers/` — send call summary + recording to a messenger.
+
+### Telegram
+
+Sends text summary + voice message via Telegram Bot API. Pure shell, no dependencies beyond `curl`, `jq`, `ffmpeg`.
+
+```bash
+cp helpers/telegram_notify.conf.example helpers/telegram_notify.conf
+nano helpers/telegram_notify.conf  # set BOT_TOKEN and CHAT_ID
+```
+
+Set in config.json:
+```json
+"post_call": {
+  "script": "/opt/sip2sip/helpers/telegram_notify.sh"
+}
+```
+
+### WhatsApp
+
+Same flow via Meta WhatsApp Cloud API. Requires a [Meta Business account](https://business.facebook.com) and a WhatsApp Business app.
+
+```bash
+cp helpers/whatsapp_notify.conf.example helpers/whatsapp_notify.conf
+nano helpers/whatsapp_notify.conf  # set TOKEN, PHONE_ID, recipient
+```
+
+Key differences from Telegram:
+- Requires business account verification by Meta
+- Recipient must message your number first (24h session window) or you need pre-approved templates
+- Free tier: 1000 service conversations/month
+
 ## SIP Phone Setup
 
 Configure your SIP phone/app (Linphone, MicroSIP, Otwrt, etc.):
