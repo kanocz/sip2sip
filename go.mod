@@ -1,6 +1,6 @@
 module sip2sip
 
-go 1.25.6
+go 1.25
 
 require (
 	github.com/emiago/diago v0.28.0 // indirect
