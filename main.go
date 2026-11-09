@@ -48,12 +48,10 @@ func main() {
 		media.RTPPortEnd = cfg.SIP.RTPPortMax
 	}
 
-	// Create recording dir if needed
-	if cfg.Recording.Enabled {
-		if err := os.MkdirAll(cfg.Recording.Dir, 0755); err != nil {
-			log.Error("Failed to create recording dir", "err", err)
-			os.Exit(1)
-		}
+	// Recordings, voicemail and CDRs all go here, so it is needed regardless of recording.enabled
+	if err := os.MkdirAll(cfg.Recording.Dir, dirPerm); err != nil {
+		log.Error("Failed to create recording dir", "err", err)
+		os.Exit(1)
 	}
 
 	// Create SIP User Agent
@@ -87,7 +85,7 @@ func main() {
 
 	// Registrar for local phones
 	realm := "sip2sip"
-	registrar := NewRegistrar(cfg.Users, realm, log.With("component", "registrar"))
+	registrar := NewRegistrar(cfg, realm, log.With("component", "registrar"))
 
 	// Create sipgo Server with REGISTER and OPTIONS handlers.
 	// These must be registered directly on the server because diago's middleware
@@ -142,8 +140,20 @@ func main() {
 					log.Error("Failed to reload config", "err", err)
 					continue
 				}
+				// The uplink registration and the SIP transport were built from the
+				// startup config; outgoing calls must keep using the same account.
+				if newCfg.Uplink.Host != cfg.Uplink.Host || newCfg.Uplink.Port != cfg.Uplink.Port ||
+					newCfg.Uplink.Username != cfg.Uplink.Username || newCfg.Uplink.Password != cfg.Uplink.Password {
+					log.Warn("uplink host/port/credentials changed: restart required, keeping the old values")
+					newCfg.Uplink.Host, newCfg.Uplink.Port = cfg.Uplink.Host, cfg.Uplink.Port
+					newCfg.Uplink.Username, newCfg.Uplink.Password = cfg.Uplink.Username, cfg.Uplink.Password
+				}
+				if newCfg.SIP != cfg.SIP {
+					log.Warn("sip section changed: restart required, keeping the old values")
+					newCfg.SIP = cfg.SIP
+				}
 				handler.UpdateConfig(newCfg)
-				registrar.UpdateUsers(newCfg.Users)
+				registrar.UpdateConfig(newCfg)
 				log.Info("Configuration reloaded", "users", len(newCfg.Users))
 				continue
 			}
@@ -174,11 +184,7 @@ func main() {
 	uplinkReg := NewUplinkRegistrar(client, &cfg.Uplink, uplinkContact, log.With("component", "uplink"))
 
 	log.Info("Registering on uplink", "host", cfg.Uplink.Host, "user", cfg.Uplink.Username)
-	err = uplinkReg.Run(ctx)
-	if err != nil && ctx.Err() == nil {
-		log.Error("Registration failed", "err", err)
-		os.Exit(1)
-	}
+	uplinkReg.Run(ctx)
 
 	log.Info("Shutdown complete")
 }

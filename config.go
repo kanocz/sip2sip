@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"time"
 )
@@ -11,6 +13,8 @@ type Config struct {
 	SIP           SIPConfig           `json:"sip"`
 	Uplink        UplinkConfig        `json:"uplink"`
 	Users         []UserConfig        `json:"users"`
+	MaxCalls      int                 `json:"max_calls"` // concurrent calls in both directions, default 3
+	AuthGuard     AuthGuardConfig     `json:"auth_guard"`
 	Dialplan      DialplanConfig      `json:"dialplan"`
 	Recording     RecordingConfig     `json:"recording"`
 	PostCall      PostCallConfig      `json:"post_call"`
@@ -33,14 +37,23 @@ type UplinkConfig struct {
 	Port           int    `json:"port"`
 	Username       string `json:"username"`
 	Password       string `json:"password"`
-	Expiry         int    `json:"expiry"`            // seconds
-	FilterCalledNo bool   `json:"filter_called_no"`  // only accept calls to our registered number
-	FilterSourceIP bool   `json:"filter_source_ip"`  // only accept calls from uplink server IP
+	Expiry         int    `json:"expiry"`           // seconds
+	FilterCalledNo bool   `json:"filter_called_no"` // only accept calls to our registered number
 }
 
 type UserConfig struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+// AuthGuardConfig blocks a source IP after MaxGuesses distinct wrong
+// login/password guesses (REGISTER or INVITE) within Window seconds, for
+// BlockTime seconds. Repeating the same wrong guess counts once.
+type AuthGuardConfig struct {
+	Enabled    bool `json:"enabled"`     // default true
+	MaxGuesses int  `json:"max_guesses"` // default 10
+	Window     int  `json:"window"`      // seconds, default 300
+	BlockTime  int  `json:"block_time"`  // seconds, default 3600
 }
 
 type DialplanConfig struct {
@@ -49,9 +62,9 @@ type DialplanConfig struct {
 
 type RecordingConfig struct {
 	Enabled      bool   `json:"enabled"`
-	Dir          string `json:"dir"`
-	Announcement string `json:"announcement"`  // WAV file to play before recording (EU compliance)
-	AnswerFirst  bool   `json:"answer_first"`  // answer caller before ringing phones (plays announcement first)
+	Dir          string `json:"dir"`          // recordings, voicemail and CDR files (default ./recordings)
+	Announcement string `json:"announcement"` // WAV file to play before recording (EU compliance)
+	AnswerFirst  bool   `json:"answer_first"` // answer caller before ringing phones (plays announcement first)
 }
 
 type PostCallConfig struct {
@@ -106,8 +119,18 @@ func LoadConfig(path string) (*Config, error) {
 			RTPPortMin: 10000,
 			RTPPortMax: 10200,
 		},
+		AuthGuard: AuthGuardConfig{
+			Enabled:    true,
+			MaxGuesses: 10,
+			Window:     300,
+			BlockTime:  3600,
+		},
+		MaxCalls: 3,
 		Dialplan: DialplanConfig{
 			InternalMaxDigits: 3,
+		},
+		Recording: RecordingConfig{
+			Dir: "./recordings",
 		},
 		Voicemail: VoicemailConfig{
 			SilenceTimeout: 10,
@@ -128,8 +151,37 @@ func LoadConfig(path string) (*Config, error) {
 	if len(cfg.Users) == 0 {
 		return nil, fmt.Errorf("at least one user is required")
 	}
-	if cfg.Recording.Enabled && cfg.Recording.Dir == "" {
-		return nil, fmt.Errorf("recording.dir is required when recording is enabled")
+	seen := make(map[string]bool, len(cfg.Users))
+	for i, u := range cfg.Users {
+		if u.Username == "" || u.Password == "" {
+			return nil, fmt.Errorf("users[%d]: username and password are required", i)
+		}
+		if seen[u.Username] {
+			return nil, fmt.Errorf("users[%d]: duplicate username %q", i, u.Username)
+		}
+		seen[u.Username] = true
+	}
+	if cfg.SIP.RTPPortMin <= 0 || cfg.SIP.RTPPortMax < cfg.SIP.RTPPortMin {
+		return nil, fmt.Errorf("sip.rtp_port_min/rtp_port_max: invalid range %d-%d", cfg.SIP.RTPPortMin, cfg.SIP.RTPPortMax)
+	}
+	if cfg.MaxCalls <= 0 {
+		return nil, fmt.Errorf("max_calls must be positive")
+	}
+	if cfg.SIP.ExternalIP == "" {
+		// The uplink Contact and every SDP carry this address, so it has to be a real one.
+		if ip := net.ParseIP(cfg.SIP.ListenAddr); ip == nil || ip.IsUnspecified() {
+			return nil, fmt.Errorf("sip.external_ip is required when sip.listen_addr is %q", cfg.SIP.ListenAddr)
+		}
+		cfg.SIP.ExternalIP = cfg.SIP.ListenAddr
+	}
+	if cfg.Recording.Dir == "" {
+		return nil, fmt.Errorf("recording.dir is required (CDR and voicemail files are stored there too)")
+	}
+	if cfg.Voicemail.SilenceTimeout <= 0 || cfg.Voicemail.MaxDuration <= 0 {
+		return nil, fmt.Errorf("voicemail.silence_timeout and max_duration must be positive")
+	}
+	if g := cfg.AuthGuard; g.MaxGuesses <= 0 || g.Window <= 0 || g.BlockTime <= 0 {
+		return nil, fmt.Errorf("auth_guard.max_guesses, window and block_time must be positive")
 	}
 
 	for i, p := range cfg.Vacation.Periods {
@@ -140,6 +192,39 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if to.Before(from) {
 			return nil, fmt.Errorf("vacation.periods[%d]: to (%s) is before from (%s)", i, p.To, p.From)
+		}
+	}
+
+	// A wrong timezone or schedule must not silently send every call to voicemail:
+	// fall back to UTC / disable the schedule and say so.
+	if tz := cfg.BusinessHours.Timezone; tz != "" {
+		if _, err := time.LoadLocation(tz); err != nil {
+			slog.Warn("Invalid business_hours.timezone, using UTC", "timezone", tz, "err", err)
+			cfg.BusinessHours.Timezone = "UTC"
+		}
+	}
+	if cfg.BusinessHours.Enabled {
+		if err := cfg.BusinessHours.validate(); err != nil {
+			slog.Warn("Invalid business_hours, schedule disabled", "err", err)
+			cfg.BusinessHours.Enabled = false
+		}
+	}
+
+	announcements := []string{
+		cfg.Recording.Announcement,
+		cfg.Voicemail.UnavailableAnnouncement,
+		cfg.BusinessHours.OutsideHoursAnnouncement,
+		cfg.Vacation.Announcement,
+	}
+	for _, p := range cfg.Vacation.Periods {
+		announcements = append(announcements, p.Announcement)
+	}
+	for _, f := range announcements {
+		if f == "" {
+			continue
+		}
+		if _, err := os.Stat(f); err != nil {
+			slog.Warn("Announcement file not accessible", "file", f, "err", err)
 		}
 	}
 

@@ -5,8 +5,10 @@ A minimal SIP B2BUA server written in Go, built on [diago](https://github.com/em
 ## Features
 
 - **SIP client**: registers on an external SIP server to receive incoming calls
-- **SIP server (registrar)**: registers 2-5 SIP phones with digest authentication (MD5, qop=auth)
-- **Incoming call filtering**: reject SIP spam by called number and/or source IP
+- **SIP server (registrar)**: registers 2-5 SIP phones with digest authentication (MD5); outgoing INVITEs from extensions are authenticated the same way
+- **Brute-force guard**: a source IP that tries too many different logins or passwords is blocked for an hour; a phone retrying one wrong password is not. Failures are logged with the IP for fail2ban
+- **Incoming call filtering**: only the uplink server's IP may deliver calls; optionally also by called number
+- **Call limit**: `max_calls` concurrent calls in both directions, the rest get 486 Busy Here
 - **Incoming call forking**: all registered phones ring simultaneously, first to answer wins
 - **NAT traversal**: symmetric RTP for mobile clients behind carrier NAT
 - **Answer-first mode**: answer caller → play announcement → ringback → ring phones
@@ -55,21 +57,48 @@ cp config.example.json config.json
 | `uplink.password` | SIP account password | — |
 | `uplink.expiry` | Registration expiry (seconds) | `300` |
 | `uplink.filter_called_no` | Only accept calls addressed to our registered number | `false` |
-| `uplink.filter_source_ip` | Only accept calls from the uplink server's IP | `false` |
 
 ### Local extensions
 
 | Parameter | Description | Default |
 |---|---|---|
 | `users` | Array of `{"username": "100", "password": "..."}` | — (required) |
+| `max_calls` | Concurrent calls, incoming and outgoing together; above it INVITEs get 486 Busy Here | `3` |
 | `dialplan.internal_max_digits` | Max digits for an internal number | `3` |
+
+A phone may ask for any registration lifetime; the server grants at most 120 seconds and says so in the 200 OK. The periodic REGISTER keeps the NAT binding of a mobile phone open, which a one-hour lifetime would let expire.
+
+### Auth guard
+
+Every REGISTER, and every INVITE that does not come from the uplink's IP, must pass digest authentication. The digest must sign the Request-URI itself (user and host), so an INVITE signed for one number cannot be redialled to another by rewriting the request line. A source IP that tries too many *different* wrong guesses is blocked. A guess is a login/password pair: an answer for an extension that does not exist is one guess per login, a wrong password is one guess per password. Retrying the same wrong credentials counts once, so a phone configured with a typo can retry for ten minutes and its owner is not locked out when the typo is fixed.
+
+An unknown login gets the same 401 challenge as a real one, so the response code does not reveal which extensions exist. Only an answer to a challenge we actually issued is counted: SIP over UDP lets anyone forge the source address, and a forger never sees the nonce, so forged packets cannot get a real phone's IP blocked.
+
+To make the password visible as "same" or "different", the challenge for a failing IP+user keeps the same nonce for up to 5 minutes and offers no `qop`; a successful answer deletes its nonce, so a captured valid response cannot be replayed.
+
+| Parameter | Description | Default |
+|---|---|---|
+| `auth_guard.enabled` | Block IPs after repeated auth failures | `true` |
+| `auth_guard.max_guesses` | Distinct wrong guesses per IP within the window that trigger a block | `10` |
+| `auth_guard.window` | Window length, seconds | `300` |
+| `auth_guard.block_time` | Block duration, seconds | `3600` |
+
+Each failure is logged as one line, and so is the block:
+
+```
+level=WARN msg="Auth failed" method=REGISTER user=100 source=203.0.113.9:5060 reason="bad credentials"
+level=WARN msg="Auth failed" method=INVITE user=999 source=203.0.113.9:5060 reason="unknown user"
+level=WARN msg="Source IP blocked after repeated auth failures" source=203.0.113.9 until=...
+```
+
+A fail2ban filter can match `msg="Auth failed" .* source=<HOST>:`.
 
 ### Recording
 
 | Parameter | Description | Default |
 |---|---|---|
 | `recording.enabled` | Enable call recording | `false` |
-| `recording.dir` | Directory for WAV and JSON files | — |
+| `recording.dir` | Directory for recordings, voicemail and CDR JSON files, used even when recording is off | `./recordings` |
 | `recording.announcement` | WAV file played before recording (EU compliance) | — |
 | `recording.answer_first` | Answer caller before ringing phones (announcement + ringback) | `false` |
 
@@ -113,7 +142,7 @@ The CDR JSON includes `"voicemail": true`, `"voicemail_reason"` and `"message_du
 | `business_hours.end_time` | End time (`HH:MM`) | — |
 | `business_hours.outside_hours_announcement` | WAV file played outside business hours | — |
 
-Day names use 3-letter English abbreviations: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`.
+Day names use 3-letter English abbreviations: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`. A schedule that cannot be parsed (unknown day, time not `HH:MM`, end not after start) is logged at startup and the schedule is disabled, so calls keep ringing instead of all going to voicemail. An unknown timezone is logged and replaced with UTC. Missing announcement files are logged too.
 
 ### Vacation
 
@@ -191,11 +220,19 @@ Set `sip.external_ip` to your public IP.
 ## Installation (systemd)
 
 ```bash
+# Service user: the unit runs as sip2sip, not root
+sudo useradd -r -s /usr/sbin/nologin -d /opt/sip2sip sip2sip
+
 # Copy files
 sudo mkdir -p /opt/sip2sip/recordings
 sudo cp sip2sip announcement.wav unavailable.wav outside_hours.wav vacation.wav /opt/sip2sip/
 sudo cp config.example.json /opt/sip2sip/config.json
 sudo nano /opt/sip2sip/config.json  # edit config
+
+# config.json holds SIP passwords, recordings hold call audio
+sudo chown -R sip2sip:sip2sip /opt/sip2sip
+sudo chmod 600 /opt/sip2sip/config.json
+sudo chmod 700 /opt/sip2sip/recordings
 
 # Install service
 sudo cp sip2sip.service /etc/systemd/system/
@@ -220,25 +257,27 @@ Sending `SIGHUP` (or `systemctl reload sip2sip`) reloads the configuration file 
 - Business hours schedule
 - Vacation periods
 - Dialplan
-- Uplink call filters
+- `max_calls`
+- `uplink.filter_called_no` (the uplink host is also re-resolved on reload and once an hour)
+- Auth guard
 
-Settings that require a restart: SIP listen address/port, external IP/port, RTP port range, uplink host/credentials.
+The `sip` section and the uplink host, port and credentials are fixed at startup. If they differ in the reloaded file, a warning is logged and the old values stay, so outgoing calls keep using the account the registration was made with.
 
 ## How It Works
 
 ### Incoming call filtering
 
-Incoming INVITEs from non-local users are checked against two optional filters:
+An INVITE is accepted from two places only:
 
-- **`filter_called_no`** (recommended): rejects calls where the To number doesn't match `uplink.username`. Blocks SIP spam/scanning attempts targeting random numbers.
-- **`filter_source_ip`**: rejects calls not originating from the uplink server's resolved IP.
+- **The uplink server's IP** (`uplink.host`, resolved at startup, on reload and once an hour): treated as an incoming call. With **`filter_called_no`** (recommended) a call whose To number is not `uplink.username` is rejected with 404, which stops scanners dialing random numbers. If the provider sends INVITEs from a server other than `uplink.host`, they are challenged instead of connected; the log line `Incoming INVITE ... uplink=false` with the provider's address is what to look for when incoming calls stop.
+- **Anywhere else**: challenged with digest auth (401) and treated as an outgoing call from the extension named in From. Without the extension's password it goes nowhere.
 
-Both filters are independent and can be combined.
+An uplink call whose caller number happens to equal a local extension is logged and still treated as incoming.
 
 ### Incoming calls
 
 1. sip2sip registers on the uplink SIP server
-2. Incoming INVITE is checked against configured filters
+2. Incoming INVITE is checked: it must come from the uplink's IP, and optionally be addressed to our number
 3. Vacation periods are checked: during a period → voicemail with `vacation.announcement`
 4. Business hours are checked (if enabled) — outside hours → voicemail with `outside_hours_announcement`
 5. Registered phones are checked — if none connected → voicemail with `unavailable_announcement`
@@ -274,7 +313,11 @@ After each call, the configured script is invoked:
 /path/to/script.sh /path/to/call.json /path/to/recording.wav
 ```
 
-If recording is disabled or the call was not answered, `none` is passed instead of the WAV path.
+If recording is disabled or the call was not answered, `none` is passed instead of the WAV path. The script is killed after 5 minutes.
+
+When a recording or voicemail could not be written (disk full, for one), the CDR carries an `"error"` field with the reason and no `recording_file`; the bundled helpers put it on the first line of the message.
+
+`caller_number` and `called_number` in the CDR contain only digits, `+`, `-` and brackets; anything else from the SIP From/To header is dropped before the file is written. CDR and WAV files are created with mode 0600 in a 0700 directory.
 
 ### CDR Format (JSON)
 
@@ -298,6 +341,8 @@ Regular call:
 }
 ```
 
+`hangup_by` is `caller`, `callee`, `timeout` (nobody answered), `voicemail` or `system` (sip2sip ended the call itself, for example after a failed answer).
+
 Voicemail:
 ```json
 {
@@ -315,6 +360,7 @@ Voicemail:
   "voicemail": true,
   "voicemail_reason": "outside_hours",
   "message_duration_seconds": 12.5,
+  "error": "voicemail recording failed: write /opt/sip2sip/recordings/vm_20260328_183000_b2c3d4e5.wav: no space left on device",
   "hangup_by": "voicemail",
   "recording_file": "/opt/sip2sip/recordings/vm_20260328_183000_b2c3d4e5.wav"
 }
@@ -331,6 +377,7 @@ Sends text summary + voice message via Telegram Bot API. Pure shell, no dependen
 ```bash
 cp helpers/telegram_notify.conf.example helpers/telegram_notify.conf
 nano helpers/telegram_notify.conf  # set BOT_TOKEN and CHAT_ID
+chmod 600 helpers/telegram_notify.conf
 ```
 
 Set in config.json:
@@ -381,7 +428,7 @@ G.711 (PCMU/PCMA) is supported. The codec is negotiated automatically between th
 ```
 
 - **Uplink registration**: custom implementation with manual digest auth
-- **Local registrar**: digest authentication (MD5, qop=auth)
+- **Local registrar**: digest authentication (MD5, single-use nonces)
 - **Call handling**: diago library for media bridging and SDP negotiation
 - **NAT traversal**: symmetric RTP on all media legs
 - **Announcement**: WAV playback to both parties before recording (EU compliance)

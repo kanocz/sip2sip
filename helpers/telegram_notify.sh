@@ -27,9 +27,11 @@ if [ -z "$CDR_JSON" ] || [ ! -f "$CDR_JSON" ]; then
     exit 1
 fi
 
-# Parse CDR fields
-CALLER=$(jq -r '.caller_number' "$CDR_JSON")
-CALLED=$(jq -r '.called_number' "$CDR_JSON")
+# Parse CDR fields. Numbers come from the network: keep only digits, + - ( )
+# so they can never be read by curl as a file reference.
+CALLER=$(jq -r '.caller_number // ""' "$CDR_JSON" | tr -cd '0-9+()-')
+CALLED=$(jq -r '.called_number // ""' "$CDR_JSON" | tr -cd '0-9+()-')
+CALLER="${CALLER:-neznamy}"
 DIRECTION=$(jq -r '.direction' "$CDR_JSON")
 ANSWERED=$(jq -r '.answered' "$CDR_JSON")
 ANSWERED_BY=$(jq -r '.answered_by // empty' "$CDR_JSON")
@@ -41,6 +43,7 @@ MSG_DURATION=$(jq -r '.message_duration_seconds // 0 | floor' "$CDR_JSON")
 # Czech label for voicemail_reason; unknown values are shown as is
 REASON=$(jq -r '{vacation: "dovolena", outside_hours: "mimo pracovni dobu", unavailable: "nikdo neni k dispozici"}[.voicemail_reason // ""] // .voicemail_reason // empty' "$CDR_JSON")
 START_TIME=$(jq -r '.start_time | split(".")[0] | gsub("T";" ")' "$CDR_JSON")
+ERROR=$(jq -r '.error // empty' "$CDR_JSON")
 
 # Format human-readable message
 if [ "$VOICEMAIL" = "true" ]; then
@@ -67,12 +70,25 @@ Od: ${CALLER}
 Cas: ${START_TIME}"
 fi
 
-API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+# A failed recording or voicemail is worth a line of its own: the audio is missing, not just late
+if [ -n "$ERROR" ]; then
+    MSG="CHYBA: ${ERROR}
+${MSG}"
+fi
 
-# Send text summary
-curl -s -X POST "$API/sendMessage" \
-    -d chat_id="$TELEGRAM_CHAT_ID" \
-    -d text="$MSG" \
+# The token is part of the URL. curl reads it from stdin (-K -), not from argv,
+# so it does not show up in `ps` for other local users.
+tg() {
+    local method="$1"; shift
+    curl -s -X POST -K - "$@" <<EOF
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}"
+EOF
+}
+
+# Send text summary. --data-urlencode keeps "+" in numbers from turning into a space.
+tg sendMessage \
+    --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+    --data-urlencode "text=$MSG" \
     > /dev/null
 
 # Send recording as voice message (if available)
@@ -82,17 +98,18 @@ if [ "$WAV_FILE" != "none" ] && [ -f "$WAV_FILE" ]; then
 
     # Convert WAV to OGG Opus for Telegram voice message bubble
     if ffmpeg -y -i "$WAV_FILE" -c:a libopus -b:a 32k "$OGG_FILE" 2>/dev/null; then
-        curl -s -X POST "$API/sendVoice" \
-            -F chat_id="$TELEGRAM_CHAT_ID" \
+        # --form-string: a value starting with @ or < would otherwise be read as a file
+        tg sendVoice \
+            --form-string "chat_id=$TELEGRAM_CHAT_ID" \
             -F voice=@"$OGG_FILE" \
-            -F caption="${CALLER}" \
+            --form-string "caption=$CALLER" \
             > /dev/null
     else
         # Fallback: send WAV as document
-        curl -s -X POST "$API/sendDocument" \
-            -F chat_id="$TELEGRAM_CHAT_ID" \
+        tg sendDocument \
+            --form-string "chat_id=$TELEGRAM_CHAT_ID" \
             -F document=@"$WAV_FILE" \
-            -F caption="${CALLER}" \
+            --form-string "caption=$CALLER" \
             > /dev/null
     fi
 fi

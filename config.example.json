@@ -13,14 +13,20 @@
     "username": "your_sip_username",
     "password": "your_sip_password",
     "expiry": 300,
-    "filter_called_no": true,
-    "filter_source_ip": false
+    "filter_called_no": true
   },
   "users": [
     { "username": "100", "password": "changeme100" },
     { "username": "101", "password": "changeme101" },
     { "username": "102", "password": "changeme102" }
   ],
+  "max_calls": 3,
+  "auth_guard": {
+    "enabled": true,
+    "max_guesses": 10,
+    "window": 300,
+    "block_time": 3600
+  },
   "dialplan": {
     "internal_max_digits": 3
   },

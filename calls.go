@@ -3,13 +3,13 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,8 +25,13 @@ type CallHandler struct {
 	registrar *Registrar
 	cfg       atomic.Pointer[Config]
 	log       *slog.Logger
-	uplinkIPs []net.IP // resolved uplink server IPs for filtering
+	uplinkIPs atomic.Pointer[[]net.IP] // resolved uplink server IPs: only they may send us incoming calls
+	active    atomic.Int32             // calls in progress, both directions
 }
+
+// uplinkResolveInterval re-resolves the uplink host: providers rotate DNS and
+// an INVITE from a server that appeared later must not be rejected.
+const uplinkResolveInterval = time.Hour
 
 func NewCallHandler(dg *diago.Diago, reg *Registrar, cfg *Config, log *slog.Logger) *CallHandler {
 	h := &CallHandler{
@@ -35,14 +40,32 @@ func NewCallHandler(dg *diago.Diago, reg *Registrar, cfg *Config, log *slog.Logg
 		log:       log,
 	}
 	h.cfg.Store(cfg)
-	// Resolve uplink IPs for incoming call filtering
-	if ips, err := net.LookupIP(cfg.Uplink.Host); err == nil {
-		h.uplinkIPs = ips
-		log.Info("Resolved uplink IPs", "host", cfg.Uplink.Host, "ips", ips)
-	} else {
-		log.Error("Failed to resolve uplink host", "host", cfg.Uplink.Host, "err", err)
-	}
+	h.uplinkIPs.Store(&[]net.IP{})
+	h.resolveUplink()
+	go func() {
+		for {
+			// While the list is empty every incoming call is rejected, so do not wait an hour.
+			wait := uplinkResolveInterval
+			if len(*h.uplinkIPs.Load()) == 0 {
+				wait = time.Minute
+			}
+			time.Sleep(wait)
+			h.resolveUplink()
+		}
+	}()
 	return h
+}
+
+// resolveUplink refreshes the uplink IP list. On DNS failure the old list stays.
+func (h *CallHandler) resolveUplink() {
+	host := h.getConfig().Uplink.Host
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		h.log.Error("Failed to resolve uplink host", "host", host, "err", err)
+		return
+	}
+	h.uplinkIPs.Store(&ips)
+	h.log.Info("Resolved uplink IPs", "host", host, "ips", ips)
 }
 
 func (h *CallHandler) getConfig() *Config {
@@ -51,35 +74,70 @@ func (h *CallHandler) getConfig() *Config {
 
 func (h *CallHandler) UpdateConfig(c *Config) {
 	h.cfg.Store(c)
+	h.resolveUplink()
 	h.log.Info("Call handler config updated")
 }
+
+// acquireCall claims a slot under max_calls. The caller releases it with releaseCall.
+func (h *CallHandler) acquireCall() bool {
+	if h.active.Add(1) > int32(h.getConfig().MaxCalls) {
+		h.active.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (h *CallHandler) releaseCall() { h.active.Add(-1) }
 
 func (h *CallHandler) HandleInvite(inDialog *diago.DialogServerSession) {
 	cfg := h.getConfig()
 	fromUser := inDialog.FromUser()
 	toUser := inDialog.ToUser()
+	source := inDialog.InviteRequest.Source()
+	fromUplink := h.isFromUplink(inDialog)
 
-	h.log.Info("Incoming INVITE", "from", fromUser, "to", toUser)
+	// uplink=false with the provider's address here means the provider sends
+	// INVITEs from a host other than uplink.host.
+	h.log.Info("Incoming INVITE", "from", fromUser, "to", toUser, "source", source, "uplink", fromUplink)
 
-	if h.registrar.IsLocalUser(fromUser) {
-		h.handleOutgoing(inDialog, fromUser, toUser)
+	if fromUplink {
+		if cfg.Uplink.FilterCalledNo && toUser != cfg.Uplink.Username {
+			h.log.Warn("Rejected INVITE: wrong called number", "from", fromUser, "to", toUser, "expected", cfg.Uplink.Username)
+			inDialog.Respond(sip.StatusNotFound, "Not Found", nil)
+			return
+		}
+		if h.registrar.IsLocalUser(fromUser) {
+			h.log.Info("Caller number matches a local extension, treating as an uplink call", "from", fromUser)
+		}
+		if !h.acquireCall() {
+			h.log.Warn("Rejected INVITE: max_calls reached", "from", fromUser, "max", cfg.MaxCalls)
+			inDialog.Respond(sip.StatusBusyHere, "Busy Here", nil)
+			return
+		}
+		defer h.releaseCall()
+		h.handleIncoming(inDialog, fromUser, toUser)
 		return
 	}
 
-	// Filter incoming calls based on config
-	if cfg.Uplink.FilterCalledNo && toUser != cfg.Uplink.Username {
-		h.log.Warn("Rejected INVITE: wrong called number", "from", fromUser, "to", toUser, "expected", cfg.Uplink.Username)
-		inDialog.Respond(sip.StatusNotFound, "Not Found", nil)
+	// Anyone else must be one of our phones and prove it with digest auth;
+	// otherwise the whole internet could place uplink calls on our account.
+	// Unknown From users get the same challenge, so the response does not
+	// reveal which extensions exist.
+	if res := h.registrar.Authorize(inDialog.InviteRequest, fromUser); res != nil {
+		var hdrs []sip.Header
+		if wa := res.GetHeader("WWW-Authenticate"); wa != nil {
+			hdrs = append(hdrs, wa)
+		}
+		inDialog.Respond(res.StatusCode, res.Reason, nil, hdrs...)
 		return
 	}
-	if cfg.Uplink.FilterSourceIP && !h.isFromUplink(inDialog) {
-		source := inDialog.InviteRequest.Source()
-		h.log.Warn("Rejected INVITE: unknown source IP", "from", fromUser, "to", toUser, "source", source)
-		inDialog.Respond(sip.StatusForbidden, "Forbidden", nil)
+	if !h.acquireCall() {
+		h.log.Warn("Rejected INVITE: max_calls reached", "from", fromUser, "max", cfg.MaxCalls)
+		inDialog.Respond(sip.StatusBusyHere, "Busy Here", nil)
 		return
 	}
-
-	h.handleIncoming(inDialog, fromUser, toUser)
+	defer h.releaseCall()
+	h.handleOutgoing(inDialog, fromUser, toUser)
 }
 
 // isFromUplink checks if the INVITE came from the uplink server's IP.
@@ -93,7 +151,7 @@ func (h *CallHandler) isFromUplink(inDialog *diago.DialogServerSession) bool {
 	if sourceIP == nil {
 		return false
 	}
-	for _, ip := range h.uplinkIPs {
+	for _, ip := range *h.uplinkIPs.Load() {
 		if ip.Equal(sourceIP) {
 			return true
 		}
@@ -110,8 +168,8 @@ func (h *CallHandler) handleIncoming(inDialog *diago.DialogServerSession, caller
 	cdr := &CDR{
 		CallID:       callID,
 		Direction:    "incoming",
-		CallerNumber: callerNum,
-		CalledNumber: calledNum,
+		CallerNumber: cleanNumber(callerNum),
+		CalledNumber: cleanNumber(calledNum),
 		StartTime:    time.Now(),
 	}
 
@@ -160,7 +218,7 @@ func (h *CallHandler) handleIncoming(inDialog *diago.DialogServerSession, caller
 
 	log.Info("Forking to registered phones", "count", len(regs))
 
-	winner, err := h.forkCall(inDialog, regs, log)
+	winner, winMed, err := h.forkCall(inDialog, regs, log)
 	if err != nil || winner == nil {
 		log.Warn("No phone answered", "err", err)
 		inDialog.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
@@ -168,22 +226,23 @@ func (h *CallHandler) handleIncoming(inDialog *diago.DialogServerSession, caller
 		return
 	}
 	defer winner.Close()
+	defer winMed.Close()
 
-	h.enableRTPNAT(winner)
+	inMed, err := inDialog.Answer(diago.AnswerOptions{})
+	if err != nil {
+		log.Error("Failed to answer incoming call", "err", err)
+		winner.Hangup(context.Background())
+		cdr.HangupBy = "system"
+		return
+	}
+	defer inMed.Close()
 
 	cdr.Answered = true
 	cdr.AnswerTime = time.Now()
 	cdr.AnsweredBy = winner.ToUser()
 
-	if err := inDialog.Answer(); err != nil {
-		log.Error("Failed to answer incoming call", "err", err)
-		winner.Hangup(context.Background())
-		cdr.HangupBy = "caller"
-		return
-	}
-
 	log.Info("Call connected", "answered_by", winner.ToUser())
-	h.bridgeWithRecording(inDialog, winner, cdr, log)
+	h.bridgeWithRecording(inDialog, inMed, winner, winMed, cdr, log, nil)
 }
 
 // handleIncomingAnswerFirst answers the caller first, plays announcement,
@@ -192,20 +251,26 @@ func (h *CallHandler) handleIncomingAnswerFirst(inDialog *diago.DialogServerSess
 	cfg := h.getConfig()
 
 	// Answer the caller immediately
-	if err := inDialog.Answer(); err != nil {
+	inMed, err := inDialog.Answer(diago.AnswerOptions{})
+	if err != nil {
 		log.Error("Failed to answer incoming call", "err", err)
-		cdr.HangupBy = "caller"
+		cdr.HangupBy = "system"
 		return
 	}
+	defer inMed.Close()
+
+	cdr.Answered = true
+	cdr.AnswerTime = time.Now()
 
 	// Set up recording BEFORE announcement so everything is captured:
 	// - Left channel: caller's audio from the moment we answer
 	// - Right channel: announcement + ringback + then callee's voice
 	var rec *recordingState
 	if cfg.Recording.Enabled {
-		wavPath, closeFn, err := h.setupRecording(inDialog, cdr, log)
+		wavPath, closeFn, err := h.setupRecording(inMed, cdr, log)
 		if err != nil {
 			log.Error("Failed to setup recording, continuing without", "err", err)
+			cdr.Error = "recording setup failed: " + err.Error()
 		} else {
 			rec = &recordingState{wavPath: wavPath, closeFn: closeFn}
 		}
@@ -214,21 +279,7 @@ func (h *CallHandler) handleIncomingAnswerFirst(inDialog *diago.DialogServerSess
 	// Drain caller's RTP through the recording-wrapped reader.
 	// This captures caller audio on the left channel during announcement + ringtone.
 	// Also prevents buffer accumulation that causes audio desync.
-	var drainStop atomic.Bool
-	drainDone := make(chan struct{})
-	if callerReader, err := inDialog.AudioReader(); err == nil {
-		go func() {
-			defer close(drainDone)
-			buf := make([]byte, media.RTPBufSize)
-			for !drainStop.Load() {
-				if _, err := callerReader.Read(buf); err != nil {
-					return
-				}
-			}
-		}()
-	} else {
-		close(drainDone)
-	}
+	stopDrain := drainAudio(inMed)
 
 	// Brief pause after answer — caller's audio path needs a moment to establish,
 	// otherwise the first second of the announcement gets clipped.
@@ -236,7 +287,7 @@ func (h *CallHandler) handleIncomingAnswerFirst(inDialog *diago.DialogServerSess
 
 	// Play announcement to caller (goes through recording-wrapped writer → right channel)
 	log.Info("Playing announcement to caller", "file", cfg.Recording.Announcement)
-	pbCaller, err := inDialog.PlaybackCreate()
+	pbCaller, err := inMed.PlaybackCreate()
 	if err != nil {
 		log.Error("Failed to create playback for announcement", "err", err)
 	} else {
@@ -249,7 +300,7 @@ func (h *CallHandler) handleIncomingAnswerFirst(inDialog *diago.DialogServerSess
 
 	// Play ringback tone to caller while phones are ringing
 	var stopRingtone func() error
-	ringtone, err := inDialog.PlaybackRingtoneCreate()
+	ringtone, err := inMed.PlaybackRingtoneCreate()
 	if err == nil {
 		stopRingtone, err = ringtone.PlayBackground()
 		if err != nil {
@@ -260,7 +311,7 @@ func (h *CallHandler) handleIncomingAnswerFirst(inDialog *diago.DialogServerSess
 	}
 
 	// Fork call to all registered phones
-	winner, forkErr := h.forkCall(inDialog, regs, log)
+	winner, winMed, forkErr := h.forkCall(inDialog, regs, log)
 
 	// Stop ringback
 	if stopRingtone != nil {
@@ -270,32 +321,24 @@ func (h *CallHandler) handleIncomingAnswerFirst(inDialog *diago.DialogServerSess
 	}
 
 	// Stop drain before bridge takes over the reader
-	drainStop.Store(true)
-	select {
-	case <-drainDone:
-	case <-time.After(100 * time.Millisecond):
-	}
+	stopDrain()
 
 	if forkErr != nil || winner == nil {
 		log.Warn("No phone answered", "err", forkErr)
-		if rec != nil && rec.closeFn != nil {
-			rec.closeFn()
-			cdr.RecordingFile = rec.wavPath
+		if rec != nil {
+			rec.close(cdr, log)
 		}
 		inDialog.Hangup(context.Background())
 		cdr.HangupBy = "timeout"
 		return
 	}
 	defer winner.Close()
+	defer winMed.Close()
 
-	h.enableRTPNAT(winner)
-
-	cdr.Answered = true
-	cdr.AnswerTime = time.Now()
 	cdr.AnsweredBy = winner.ToUser()
 
 	log.Info("Call connected", "answered_by", winner.ToUser())
-	h.bridgeWithRecordingState(inDialog, winner, cdr, log, rec)
+	h.bridgeWithRecording(inDialog, inMed, winner, winMed, cdr, log, rec)
 }
 
 // handleOutgoing handles calls from local phones - route to uplink or internal.
@@ -307,8 +350,8 @@ func (h *CallHandler) handleOutgoing(inDialog *diago.DialogServerSession, caller
 	cdr := &CDR{
 		CallID:       callID,
 		Direction:    "outgoing",
-		CallerNumber: callerNum,
-		CalledNumber: calledNum,
+		CallerNumber: cleanNumber(callerNum),
+		CalledNumber: cleanNumber(calledNum),
 		StartTime:    time.Now(),
 	}
 
@@ -344,8 +387,9 @@ func (h *CallHandler) handleInternalCall(inDialog *diago.DialogServerSession, ca
 	ctx, cancel := context.WithTimeout(inDialog.Context(), 60*time.Second)
 	defer cancel()
 
-	outDialog, err := h.dg.Invite(ctx, uri, diago.InviteOptions{
+	outDialog, outMed, err := h.dg.Invite(ctx, uri, diago.InviteOptions{
 		Originator: inDialog,
+		RTPNAT:     media.RTPNATSymetric,
 	})
 	if err != nil {
 		log.Warn("Internal call: invite failed", "err", err)
@@ -354,21 +398,23 @@ func (h *CallHandler) handleInternalCall(inDialog *diago.DialogServerSession, ca
 		return
 	}
 	defer outDialog.Close()
+	defer outMed.Close()
 
-	h.enableRTPNAT(outDialog)
+	inMed, err := inDialog.Answer(diago.AnswerOptions{RTPNAT: media.RTPNATSymetric})
+	if err != nil {
+		log.Error("Failed to answer", "err", err)
+		outDialog.Hangup(context.Background())
+		cdr.HangupBy = "system"
+		return
+	}
+	defer inMed.Close()
 
 	cdr.Answered = true
 	cdr.AnswerTime = time.Now()
 	cdr.AnsweredBy = calledNum
 
-	if err := inDialog.Answer(); err != nil {
-		log.Error("Failed to answer", "err", err)
-		outDialog.Hangup(context.Background())
-		return
-	}
-
 	log.Info("Internal call connected")
-	h.bridgeWithRecording(inDialog, outDialog, cdr, log)
+	h.bridgeWithRecording(inDialog, inMed, outDialog, outMed, cdr, log, nil)
 }
 
 func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, callerNum, calledNum string, cdr *CDR, log *slog.Logger) {
@@ -398,7 +444,7 @@ func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, call
 	}
 	from.Params.Remove("tag")
 
-	outDialog, err := h.dg.Invite(ctx, uplinkURI, diago.InviteOptions{
+	outDialog, outMed, err := h.dg.Invite(ctx, uplinkURI, diago.InviteOptions{
 		Username: cfg.Uplink.Username,
 		Password: cfg.Uplink.Password,
 		Headers:  []sip.Header{from},
@@ -410,35 +456,41 @@ func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, call
 		return
 	}
 	defer outDialog.Close()
+	defer outMed.Close()
 
 	// The bridge copies RTP without transcoding, so the phone must use
 	// the same codec the uplink chose.
-	codec := media.CodecAudioFromSession(outDialog.MediaSession())
+	codec := media.CodecAudioFromSession(outMed.MediaSession())
 	log.Info("Uplink codec negotiated", "codec", codec.Name)
+
+	inMed, err := inDialog.Answer(diago.AnswerOptions{
+		Codecs: []media.Codec{codec, media.CodecTelephoneEvent8000},
+		RTPNAT: media.RTPNATSymetric,
+	})
+	if err != nil {
+		log.Error("Failed to answer phone with uplink codec", "codec", codec.Name, "err", err)
+		outDialog.Hangup(context.Background())
+		cdr.HangupBy = "system"
+		return
+	}
+	defer inMed.Close()
 
 	cdr.Answered = true
 	cdr.AnswerTime = time.Now()
 
-	if err := inDialog.AnswerOptions(diago.AnswerOptions{
-		Codecs: []media.Codec{codec, media.CodecTelephoneEvent8000},
-	}); err != nil {
-		log.Error("Failed to answer phone with uplink codec", "codec", codec.Name, "err", err)
-		outDialog.Hangup(context.Background())
-		return
-	}
-
 	log.Info("Outgoing call connected")
-	h.bridgeWithRecording(inDialog, outDialog, cdr, log)
+	h.bridgeWithRecording(inDialog, inMed, outDialog, outMed, cdr, log, nil)
 }
 
 // forkCall invites all registered phones in parallel, returns the first to answer.
-func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Registration, log *slog.Logger) (*diago.DialogClientSession, error) {
+func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Registration, log *slog.Logger) (*diago.DialogClientSession, *diago.DialogMedia, error) {
 	ctx, cancel := context.WithTimeout(inDialog.Context(), 30*time.Second)
 	defer cancel()
 
 	var (
 		mu     sync.Mutex
 		winner *diago.DialogClientSession
+		winMed *diago.DialogMedia
 		wg     sync.WaitGroup
 	)
 
@@ -450,8 +502,12 @@ func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Regi
 
 			log.Info("Inviting phone", "user", username, "uri", u.String())
 
-			d, err := h.dg.Invite(ctx, u, diago.InviteOptions{
+			// Symmetric RTP on every phone leg: a LAN phone and a mobile behind
+			// carrier NAT both show private addresses in SDP, and learning the
+			// real source from the first packet is harmless for the LAN one.
+			d, med, err := h.dg.Invite(ctx, u, diago.InviteOptions{
 				Originator: inDialog,
+				RTPNAT:     media.RTPNATSymetric,
 			})
 			if err != nil {
 				log.Debug("Phone didn't answer", "user", username, "err", err)
@@ -460,13 +516,14 @@ func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Regi
 
 			mu.Lock()
 			if winner == nil {
-				winner = d
+				winner, winMed = d, med
 				cancel() // Cancel remaining invites
 				mu.Unlock()
 				log.Info("Phone answered", "user", username)
 			} else {
 				mu.Unlock()
 				d.Hangup(context.Background())
+				med.Close()
 				d.Close()
 			}
 		}(uri, reg.Username)
@@ -475,25 +532,37 @@ func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Regi
 	wg.Wait()
 
 	if winner == nil {
-		return nil, fmt.Errorf("no phones answered")
+		return nil, nil, fmt.Errorf("no phones answered")
 	}
-	return winner, nil
+	return winner, winMed, nil
 }
 
-// enableRTPNAT enables symmetric RTP on the outgoing dialog.
-// Always enabled because we can't distinguish LAN private IPs (192.168.x.x)
-// from carrier CGNAT private IPs (10.x.x.x) — both appear as private.
-// Symmetric RTP is safe for LAN phones too (learns correct source on first packet).
-func (h *CallHandler) enableRTPNAT(d *diago.DialogClientSession) {
-	if ms := d.MediaSession(); ms != nil {
-		ms.RTPNAT = media.RTPNATSymetric
+// drainAudio keeps reading med's audio in the background until stop is called:
+// the recording stays fed and the socket buffer does not pile up while the
+// caller only hears playback. stop unblocks a Read that is waiting for a packet
+// that never comes, so no stale reader is left to steal the bridge's first packet.
+func drainAudio(med *diago.DialogMedia) (stop func()) {
+	reader, err := med.AudioReader()
+	if err != nil {
+		return func() {}
 	}
-}
-
-// bridgeWithRecording proxies audio between two dialog sessions with optional stereo recording.
-// If recState is non-nil, recording is already set up (answer_first mode).
-func (h *CallHandler) bridgeWithRecording(inDialog *diago.DialogServerSession, outDialog *diago.DialogClientSession, cdr *CDR, log *slog.Logger) {
-	h.bridgeWithRecordingState(inDialog, outDialog, cdr, log, nil)
+	var stopped atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, media.RTPBufSize)
+		for !stopped.Load() {
+			if _, err := reader.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	return func() {
+		stopped.Store(true)
+		med.StopRTP(1, 0)
+		<-done
+		med.StartRTP(1, 0)
+	}
 }
 
 type recordingState struct {
@@ -501,48 +570,53 @@ type recordingState struct {
 	closeFn func() error
 }
 
-func (h *CallHandler) bridgeWithRecordingState(inDialog *diago.DialogServerSession, outDialog *diago.DialogClientSession, cdr *CDR, log *slog.Logger, rec *recordingState) {
+// close flushes the recording and records the file, or the failure, in the CDR.
+func (r *recordingState) close(cdr *CDR, log *slog.Logger) {
+	if err := r.closeFn(); err != nil {
+		log.Error("Failed to close recording", "file", r.wavPath, "err", err)
+		cdr.Error = "recording failed: " + err.Error()
+	}
+	cdr.RecordingFile = r.wavPath
+}
+
+// bridgeWithRecording proxies audio between two dialog sessions with optional stereo recording.
+// If rec is non-nil, recording is already set up (answer_first mode).
+func (h *CallHandler) bridgeWithRecording(inDialog *diago.DialogServerSession, inMed *diago.DialogMedia, outDialog *diago.DialogClientSession, outMed *diago.DialogMedia, cdr *CDR, log *slog.Logger, rec *recordingState) {
 	cfg := h.getConfig()
 
 	// Set up recording if not already done (answer_first sets it up earlier)
 	if rec == nil && cfg.Recording.Enabled {
-		wavPath, closeFn, err := h.setupRecording(inDialog, cdr, log)
+		wavPath, closeFn, err := h.setupRecording(inMed, cdr, log)
 		if err != nil {
 			log.Error("Failed to setup recording, continuing without", "err", err)
+			cdr.Error = "recording setup failed: " + err.Error()
 		} else {
 			rec = &recordingState{wavPath: wavPath, closeFn: closeFn}
 		}
 	}
 
-	if rec != nil && rec.closeFn != nil {
-		defer func() {
-			if err := rec.closeFn(); err != nil {
-				log.Error("Failed to close recording", "err", err)
-			}
-			cdr.RecordingFile = rec.wavPath
-		}()
+	if rec != nil {
+		defer rec.close(cdr, log)
 	}
 
 	// Play announcement to both sides if configured and not in answer_first mode
 	// (answer_first plays announcement earlier in the flow)
 	if cfg.Recording.Announcement != "" && cfg.Recording.Enabled && !cfg.Recording.AnswerFirst {
-		h.playAnnouncement(inDialog, outDialog, log)
+		h.playAnnouncement(inMed, outMed, log)
 	}
 
-	// Audio readers/writers wrapped with RFC 4733 DTMF handling.
-	// They wrap the current reader/writer, so recording (if set) stays in the chain.
-	aReader := inDialog.AudioReaderDTMF()
-	aWriter := inDialog.AudioWriterDTMF()
-	bReader := outDialog.AudioReaderDTMF()
-	bWriter := outDialog.AudioWriterDTMF()
+	// Audio readers/writers wrapped with RFC 4733 DTMF handling. They wrap the
+	// current reader/writer, so recording (if set) stays in the chain. A leg
+	// without telephone-event falls back to plain audio.
+	aReader, aWriter := audioEndpoints(inMed, "caller", log)
+	bReader, bWriter := audioEndpoints(outMed, "callee", log)
 
 	// DTMF is regenerated on the other leg after the digit ends, not passed through.
 	// Raw event packets would go out with the audio payload type and turn into noise.
-	forwardDTMF := func(from string, to *diago.DTMFWriter, toMS *media.MediaSession) func(rune) error {
-		enabled := toMS != nil && slices.Contains(toMS.CommonCodecs(), media.CodecTelephoneEvent8000)
+	forwardDTMF := func(from string, to *diago.DTMFWriter) func(rune) error {
 		return func(d rune) error {
-			log.Info("DTMF", "from", from, "digit", string(d), "forwarded", enabled)
-			if enabled {
+			log.Info("DTMF", "from", from, "digit", string(d), "forwarded", to != nil)
+			if to != nil {
 				if err := to.WriteDTMF(d); err != nil {
 					log.Warn("DTMF forward failed", "err", err)
 				}
@@ -550,27 +624,32 @@ func (h *CallHandler) bridgeWithRecordingState(inDialog *diago.DialogServerSessi
 			return nil
 		}
 	}
-	aReader.OnDTMF(forwardDTMF("caller", bWriter, outDialog.MediaSession()))
-	bReader.OnDTMF(forwardDTMF("callee", aWriter, inDialog.MediaSession()))
+	if r, ok := aReader.(*diago.DTMFReader); ok {
+		r.OnDTMF(forwardDTMF("caller", bWriter))
+	}
+	if r, ok := bReader.(*diago.DTMFReader); ok {
+		r.OnDTMF(forwardDTMF("callee", aWriter))
+	}
 
 	// Log media session addresses for NAT debugging
-	if inMS := inDialog.MediaSession(); inMS != nil {
+	if inMS := inMed.MediaSession(); inMS != nil {
 		log.Debug("inDialog media", "local", inMS.Laddr.String(), "remote", inMS.Raddr.String(), "rtpnat", inMS.RTPNAT)
 	}
-	if outMS := outDialog.MediaSession(); outMS != nil {
+	if outMS := outMed.MediaSession(); outMS != nil {
 		log.Debug("outDialog media", "local", outMS.Laddr.String(), "remote", outMS.Raddr.String(), "rtpnat", outMS.RTPNAT)
 	}
 
-	// Bridge: proxy audio between both sides
+	// Bridge: proxy audio between both sides. A read error means that side
+	// hung up, a write error means the other side did.
 	done := make(chan string, 2)
 
 	go func() {
-		copyAudio(aReader, inDialog.RTPPacketReader, bWriter) // A → B
-		done <- "caller"
+		err := copyAudio(aReader, inMed.RTPPacketReader, writerOf(bWriter, outMed)) // A → B
+		done <- pick(errors.Is(err, errWrite), "callee", "caller")
 	}()
 	go func() {
-		copyAudio(bReader, outDialog.RTPPacketReader, aWriter) // B → A
-		done <- "callee"
+		err := copyAudio(bReader, outMed.RTPPacketReader, writerOf(aWriter, inMed)) // B → A
+		done <- pick(errors.Is(err, errWrite), "caller", "callee")
 	}()
 
 	// Wait for one side to hang up
@@ -582,8 +661,55 @@ func (h *CallHandler) bridgeWithRecordingState(inDialog *diago.DialogServerSessi
 	inDialog.Hangup(context.Background())
 }
 
+// audioEndpoints returns the DTMF-aware reader and writer of a leg, or the plain
+// audio reader and a nil writer when telephone-event was not negotiated on it.
+func audioEndpoints(med *diago.DialogMedia, side string, log *slog.Logger) (io.Reader, *diago.DTMFWriter) {
+	var r io.Reader
+	dr, err := med.AudioReaderDTMF()
+	if err == nil {
+		r = dr
+	} else {
+		log.Debug("No DTMF on leg, plain audio", "side", side, "err", err)
+		if r, err = med.AudioReader(); err != nil {
+			log.Error("No audio reader on leg", "side", side, "err", err)
+			r = eofReader{}
+		}
+	}
+	w, err := med.AudioWriterDTMF()
+	if err != nil {
+		return r, nil
+	}
+	return r, w
+}
+
+// writerOf picks the DTMF writer when the leg has one, else the plain audio writer.
+func writerOf(w *diago.DTMFWriter, med *diago.DialogMedia) io.Writer {
+	if w != nil {
+		return w
+	}
+	aw, err := med.AudioWriter()
+	if err != nil {
+		return io.Discard
+	}
+	return aw
+}
+
+type eofReader struct{}
+
+func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+var errWrite = errors.New("write failed")
+
+func pick[T any](cond bool, a, b T) T {
+	if cond {
+		return a
+	}
+	return b
+}
+
 // copyAudio is media.Copy that skips telephone-event packets: the reader has already
 // turned them into an OnDTMF callback, and writing them on would send them as audio.
+// Write errors are wrapped in errWrite so the caller can tell the sides apart.
 func copyAudio(r io.Reader, pr *media.RTPPacketReader, w io.Writer) error {
 	buf := make([]byte, media.RTPBufSize)
 	for {
@@ -595,40 +721,25 @@ func copyAudio(r io.Reader, pr *media.RTPPacketReader, w io.Writer) error {
 			continue
 		}
 		if _, err := w.Write(buf[:n]); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errWrite, err)
 		}
 	}
 }
 
 // playAnnouncement plays a WAV file to both call parties simultaneously.
-func (h *CallHandler) playAnnouncement(inDialog *diago.DialogServerSession, outDialog *diago.DialogClientSession, log *slog.Logger) {
+func (h *CallHandler) playAnnouncement(inMed, outMed *diago.DialogMedia, log *slog.Logger) {
 	cfg := h.getConfig()
 	log.Info("Playing announcement", "file", cfg.Recording.Announcement)
 
-	pbCaller, err1 := inDialog.PlaybackCreate()
-	pbCallee, err2 := outDialog.PlaybackCreate()
+	pbCaller, err1 := inMed.PlaybackCreate()
+	pbCallee, err2 := outMed.PlaybackCreate()
 	if err1 != nil || err2 != nil {
 		log.Error("Failed to create playback for announcement", "err_in", err1, "err_out", err2)
 		return
 	}
 
 	// Drain caller's audio during announcement so it gets recorded on the left channel
-	var drainStop atomic.Bool
-	drainDone := make(chan struct{})
-	callerReader, err := inDialog.AudioReader()
-	if err == nil {
-		go func() {
-			defer close(drainDone)
-			buf := make([]byte, media.RTPBufSize)
-			for !drainStop.Load() {
-				if _, err := callerReader.Read(buf); err != nil {
-					return
-				}
-			}
-		}()
-	} else {
-		close(drainDone)
-	}
+	stopDrain := drainAudio(inMed)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -646,32 +757,28 @@ func (h *CallHandler) playAnnouncement(inDialog *diago.DialogServerSession, outD
 	}()
 	wg.Wait()
 
-	drainStop.Store(true)
-	select {
-	case <-drainDone:
-	case <-time.After(100 * time.Millisecond):
-	}
+	stopDrain()
 
 	log.Debug("Announcement finished")
 }
 
-// setupRecording sets up stereo WAV recording on the incoming dialog.
-func (h *CallHandler) setupRecording(inDialog *diago.DialogServerSession, cdr *CDR, log *slog.Logger) (string, func() error, error) {
+// setupRecording sets up stereo WAV recording on the incoming leg.
+func (h *CallHandler) setupRecording(inMed *diago.DialogMedia, cdr *CDR, log *slog.Logger) (string, func() error, error) {
 	cfg := h.getConfig()
 
-	if err := os.MkdirAll(cfg.Recording.Dir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.Recording.Dir, dirPerm); err != nil {
 		return "", nil, fmt.Errorf("create recording dir: %w", err)
 	}
 
 	filename := fmt.Sprintf("%s_%s.wav", cdr.StartTime.Format("20060102_150405"), cdr.CallID)
 	wavPath := filepath.Join(cfg.Recording.Dir, filename)
 
-	wavFile, err := os.Create(wavPath)
+	wavFile, err := os.OpenFile(wavPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, filePerm)
 	if err != nil {
 		return "", nil, fmt.Errorf("create wav file: %w", err)
 	}
 
-	rec, err := inDialog.AudioStereoRecordingCreate(wavFile)
+	rec, err := inMed.AudioStereoRecordingCreate(wavFile)
 	if err != nil {
 		wavFile.Close()
 		os.Remove(wavPath)
@@ -679,8 +786,8 @@ func (h *CallHandler) setupRecording(inDialog *diago.DialogServerSession, cdr *C
 	}
 
 	mon := rec.AudioReader()
-	inDialog.SetAudioReader(mon)
-	inDialog.SetAudioWriter(mon)
+	inMed.SetAudioReader(mon)
+	inMed.SetAudioWriter(mon)
 
 	log.Info("Recording started", "file", wavPath)
 
@@ -703,13 +810,10 @@ func (h *CallHandler) finishCall(cdr *CDR, log *slog.Logger) {
 		"answered", cdr.Answered,
 		"duration", cdr.Duration,
 		"talk_time", cdr.TalkTime,
+		"error", cdr.Error,
 	)
 
-	cdrDir := cfg.Recording.Dir
-	if cdrDir == "" {
-		cdrDir = "."
-	}
-	jsonPath, err := SaveCDR(cdr, cdrDir)
+	jsonPath, err := SaveCDR(cdr, cfg.Recording.Dir)
 	if err != nil {
 		log.Error("Failed to save CDR", "err", err)
 		return

@@ -1,1 +1,5 @@
 sip2sip
+config.json
+helpers/*.conf
+recordings/
+.DS_Store

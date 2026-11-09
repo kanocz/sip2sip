@@ -30,3 +30,21 @@ func TestFindVacation(t *testing.T) {
 		t.Errorf("per-period announcement lost: %+v", p)
 	}
 }
+
+func TestBusinessHoursValidate(t *testing.T) {
+	ok := BusinessHoursConfig{Days: []string{"Mon", "fri"}, StartTime: "09:00", EndTime: "17:30"}
+	if err := ok.validate(); err != nil {
+		t.Fatalf("valid schedule rejected: %v", err)
+	}
+	for name, c := range map[string]BusinessHoursConfig{
+		"bad day":   {Days: []string{"monday"}, StartTime: "09:00", EndTime: "17:00"},
+		"bad time":  {Days: []string{"mon"}, StartTime: "9am", EndTime: "17:00"},
+		"end first": {Days: []string{"mon"}, StartTime: "17:00", EndTime: "09:00"},
+		"no days":   {StartTime: "09:00", EndTime: "17:00"},
+		"24h clock": {Days: []string{"mon"}, StartTime: "09:00", EndTime: "24:00"},
+	} {
+		if err := c.validate(); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+}

@@ -10,7 +10,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	"github.com/emiago/diago"
@@ -24,11 +23,13 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 	cfg := h.getConfig()
 
 	// Answer the call
-	if err := inDialog.Answer(); err != nil {
+	med, err := inDialog.Answer(diago.AnswerOptions{})
+	if err != nil {
 		log.Error("Failed to answer for voicemail", "err", err)
 		cdr.HangupBy = "system"
 		return
 	}
+	defer med.Close()
 
 	cdr.Answered = true
 	cdr.AnswerTime = time.Now()
@@ -37,21 +38,7 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 	cdr.VoicemailReason = reason
 
 	// Drain caller's audio during announcement to prevent buffer buildup
-	var drainStop atomic.Bool
-	drainDone := make(chan struct{})
-	if reader, err := inDialog.AudioReader(); err == nil {
-		go func() {
-			defer close(drainDone)
-			buf := make([]byte, media.RTPBufSize)
-			for !drainStop.Load() {
-				if _, err := reader.Read(buf); err != nil {
-					return
-				}
-			}
-		}()
-	} else {
-		close(drainDone)
-	}
+	stopDrain := drainAudio(med)
 
 	// Brief pause for media path to establish
 	time.Sleep(1 * time.Second)
@@ -59,7 +46,7 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 	// Play announcement
 	if announcement != "" {
 		log.Info("Playing voicemail announcement", "file", announcement)
-		if pb, err := inDialog.PlaybackCreate(); err == nil {
+		if pb, err := med.PlaybackCreate(); err == nil {
 			if _, err := pb.PlayFile(announcement); err != nil {
 				log.Error("Announcement playback failed", "err", err)
 			}
@@ -70,22 +57,14 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 
 	// Check if caller hung up during announcement
 	if inDialog.Context().Err() != nil {
-		drainStop.Store(true)
-		select {
-		case <-drainDone:
-		case <-time.After(100 * time.Millisecond):
-		}
+		stopDrain()
 		cdr.HangupBy = "caller"
 		return
 	}
 
 	// If voicemail recording not enabled, hang up after announcement
 	if !cfg.Voicemail.Enabled {
-		drainStop.Store(true)
-		select {
-		case <-drainDone:
-		case <-time.After(100 * time.Millisecond):
-		}
+		stopDrain()
 		time.Sleep(500 * time.Millisecond)
 		inDialog.Hangup(context.Background())
 		cdr.HangupBy = "system"
@@ -93,18 +72,14 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 	}
 
 	// Play beep tone to signal recording start
-	h.playBeepTone(inDialog, log)
+	h.playBeepTone(med, log)
 
 	// Stop drain before recording takes over the reader
-	drainStop.Store(true)
-	select {
-	case <-drainDone:
-	case <-time.After(100 * time.Millisecond):
-	}
+	stopDrain()
 
 	// Get audio reader with codec info for proper decoding
 	var mprops diago.MediaProps
-	reader, err := inDialog.AudioReader(diago.WithAudioReaderMediaProps(&mprops))
+	reader, err := med.AudioReader(diago.WithAudioReaderMediaProps(&mprops))
 	if err != nil {
 		log.Error("Failed to get audio reader for voicemail", "err", err)
 		inDialog.Hangup(context.Background())
@@ -124,14 +99,11 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 
 	// Create mono WAV file for the voicemail message
 	recDir := cfg.Recording.Dir
-	if recDir == "" {
-		recDir = "."
-	}
-	os.MkdirAll(recDir, 0755)
+	os.MkdirAll(recDir, dirPerm)
 
 	filename := fmt.Sprintf("vm_%s_%s.wav", cdr.StartTime.Format("20060102_150405"), cdr.CallID)
 	wavPath := filepath.Join(recDir, filename)
-	wavFile, err := os.Create(wavPath)
+	wavFile, err := os.OpenFile(wavPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, filePerm)
 	if err != nil {
 		log.Error("Failed to create voicemail file", "err", err)
 		inDialog.Hangup(context.Background())
@@ -149,18 +121,31 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reaso
 
 	// Record: read G.711 → decode to PCM → write to WAV + silence detection
 	messageStart := time.Now()
-	dataSize := recordVoicemail(reader, wavFile, decodeFn, silenceTimeout, maxDuration, inDialog.Context(), log)
-	cdr.MessageDuration = time.Since(messageStart).Seconds()
+	dataSize, lastSound, err := recordVoicemail(reader, wavFile, decodeFn, silenceTimeout, maxDuration, inDialog.Context(), log)
+	// The trailing silence that stopped the recording is not part of the message.
+	cdr.MessageDuration = lastSound.Sub(messageStart).Seconds()
 
 	// Update WAV header with actual data size
-	wavFile.Seek(0, io.SeekStart)
-	writeMonoWavHeader(wavFile, uint32(dataSize))
-	wavFile.Close()
+	if err == nil {
+		_, err = wavFile.Seek(0, io.SeekStart)
+	}
+	if err == nil {
+		err = writeMonoWavHeader(wavFile, uint32(dataSize))
+	}
+	if closeErr := wavFile.Close(); err == nil {
+		err = closeErr
+	}
 
-	if dataSize > 0 {
+	switch {
+	case err != nil:
+		// A half-written file would be sent out as if it were the message.
+		os.Remove(wavPath)
+		log.Error("Voicemail recording failed", "file", wavPath, "err", err)
+		cdr.Error = "voicemail recording failed: " + err.Error()
+	case dataSize > 0:
 		cdr.RecordingFile = wavPath
 		log.Info("Voicemail saved", "file", wavPath, "message_duration", cdr.MessageDuration)
-	} else {
+	default:
 		os.Remove(wavPath)
 		log.Info("No voicemail recorded (empty)")
 	}
@@ -184,34 +169,35 @@ func g711Decoder(payloadType uint8) (g711DecoderFunc, error) {
 }
 
 // recordVoicemail reads encoded audio, decodes to PCM, writes to the WAV file,
-// and monitors for silence. Returns total PCM bytes written.
-func recordVoicemail(reader io.Reader, writer io.Writer, decode g711DecoderFunc, silenceTimeout, maxDuration time.Duration, ctx context.Context, log *slog.Logger) int {
+// and monitors for silence. Returns total PCM bytes written, when the caller
+// was last heard, and the first write error (disk full, for one).
+func recordVoicemail(reader io.Reader, writer io.Writer, decode g711DecoderFunc, silenceTimeout, maxDuration time.Duration, ctx context.Context, log *slog.Logger) (int, time.Time, error) {
 	encodedBuf := make([]byte, media.RTPBufSize)
 	pcmBuf := make([]byte, media.RTPBufSize*2) // G.711 decodes 1:2
 	totalWritten := 0
 	startTime := time.Now()
-	lastSoundTime := time.Now()
+	lastSoundTime := startTime
 
 	const silenceThreshold = 500.0 // RMS amplitude threshold for 16-bit PCM
 
 	for {
 		if ctx.Err() != nil {
 			log.Debug("Voicemail: caller hung up")
-			return totalWritten
+			return totalWritten, lastSoundTime, nil
 		}
 		if time.Since(startTime) >= maxDuration {
 			log.Debug("Voicemail: max duration reached")
-			return totalWritten
+			return totalWritten, lastSoundTime, nil
 		}
 		if time.Since(lastSoundTime) >= silenceTimeout {
 			log.Debug("Voicemail: silence timeout")
-			return totalWritten
+			return totalWritten, lastSoundTime, nil
 		}
 
 		n, err := reader.Read(encodedBuf)
 		if err != nil {
 			log.Debug("Voicemail: read ended", "err", err)
-			return totalWritten
+			return totalWritten, lastSoundTime, nil
 		}
 		if n == 0 {
 			continue
@@ -227,7 +213,9 @@ func recordVoicemail(reader io.Reader, writer io.Writer, decode g711DecoderFunc,
 			continue
 		}
 
-		writer.Write(pcmBuf[:pcmN])
+		if _, err := writer.Write(pcmBuf[:pcmN]); err != nil {
+			return totalWritten, lastSoundTime, err
+		}
 		totalWritten += pcmN
 
 		if rmsLevel(pcmBuf[:pcmN]) > silenceThreshold {
@@ -237,7 +225,7 @@ func recordVoicemail(reader io.Reader, writer io.Writer, decode g711DecoderFunc,
 }
 
 // playBeepTone generates and plays a short beep tone to signal recording start.
-func (h *CallHandler) playBeepTone(inDialog *diago.DialogServerSession, log *slog.Logger) {
+func (h *CallHandler) playBeepTone(med *diago.DialogMedia, log *slog.Logger) {
 	// Generate 0.5s of 1kHz sine wave at 8000Hz, 16-bit mono PCM
 	const sampleRate = 8000
 	const durationSec = 0.5
@@ -271,7 +259,7 @@ func (h *CallHandler) playBeepTone(inDialog *diago.DialogServerSession, log *slo
 	tmpFile.Close()
 
 	// Play the beep
-	pb, err := inDialog.PlaybackCreate()
+	pb, err := med.PlaybackCreate()
 	if err != nil {
 		log.Error("Failed to create playback for beep", "err", err)
 		return
@@ -310,8 +298,8 @@ func writeMonoWavHeader(w io.Writer, dataSize uint32) error {
 	binary.Write(&buf, binary.LittleEndian, uint32(36+dataSize))
 	buf.WriteString("WAVE")
 	buf.WriteString("fmt ")
-	binary.Write(&buf, binary.LittleEndian, uint32(16))  // chunk size
-	binary.Write(&buf, binary.LittleEndian, uint16(1))   // PCM format
+	binary.Write(&buf, binary.LittleEndian, uint32(16)) // chunk size
+	binary.Write(&buf, binary.LittleEndian, uint16(1))  // PCM format
 	binary.Write(&buf, binary.LittleEndian, numChannels)
 	binary.Write(&buf, binary.LittleEndian, sampleRate)
 	binary.Write(&buf, binary.LittleEndian, byteRate)

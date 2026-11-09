@@ -9,16 +9,17 @@ import (
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/icholy/digest"
 )
 
 // UplinkRegistrar handles registration on the external SIP server.
-// It implements digest auth manually for full control and debug logging.
+// It does the digest exchange itself for full control and debug logging.
 type UplinkRegistrar struct {
-	client   *sipgo.Client
-	cfg      *UplinkConfig
-	contact  sip.ContactHeader
-	log      *slog.Logger
-	expiry   time.Duration
+	client  *sipgo.Client
+	cfg     *UplinkConfig
+	contact sip.ContactHeader
+	log     *slog.Logger
+	expiry  time.Duration // what the server granted last time
 }
 
 func NewUplinkRegistrar(client *sipgo.Client, cfg *UplinkConfig, contact sip.ContactHeader, log *slog.Logger) *UplinkRegistrar {
@@ -32,32 +33,47 @@ func NewUplinkRegistrar(client *sipgo.Client, cfg *UplinkConfig, contact sip.Con
 }
 
 // Run registers and keeps re-registering until ctx is cancelled.
-// On cancel, sends unregister (Expires: 0).
-func (r *UplinkRegistrar) Run(ctx context.Context) error {
-	if err := r.register(ctx); err != nil {
-		return err
+// On cancel, sends unregister (Expires: 0). A provider that is down at startup
+// is retried every 5s: local phones can still call each other meanwhile.
+func (r *UplinkRegistrar) Run(ctx context.Context) {
+	for {
+		err := r.register(ctx, r.expiry)
+		if err == nil {
+			break
+		}
+		r.log.Error("Registration failed, retrying in 5s", "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 	r.log.Info("Registered on uplink", "expiry", r.expiry)
 
-	// Re-register loop at 75% of expiry
-	reregInterval := r.expiry * 3 / 4
-	if reregInterval < 30*time.Second {
-		reregInterval = 30 * time.Second
-	}
-
+	retry := false
 	for {
+		// 75% of the expiry the server actually granted, recomputed every round;
+		// after a failure try again in 5s instead of waiting a full interval.
+		wait := max(r.expiry*3/4, 30*time.Second)
+		if retry {
+			wait = 5 * time.Second
+		}
+
 		select {
 		case <-ctx.Done():
-			// Unregister
 			unregCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			r.unregister(unregCtx)
-			return nil
-		case <-time.After(reregInterval):
-			if err := r.register(ctx); err != nil {
+			if err := r.register(unregCtx, 0); err != nil {
+				r.log.Error("Unregister failed", "err", err)
+			} else {
+				r.log.Info("Unregistered")
+			}
+			return
+		case <-time.After(wait):
+			err := r.register(ctx, r.expiry)
+			retry = err != nil
+			if err != nil {
 				r.log.Error("Re-registration failed", "err", err)
-				// Retry sooner
-				time.Sleep(5 * time.Second)
 			} else {
 				r.log.Debug("Re-registered", "expiry", r.expiry)
 			}
@@ -65,10 +81,10 @@ func (r *UplinkRegistrar) Run(ctx context.Context) error {
 	}
 }
 
-func (r *UplinkRegistrar) register(ctx context.Context) error {
-	recipient := sip.Uri{
-		Host: r.cfg.Host,
-	}
+// register sends REGISTER with the given expiry (0 unregisters) and answers
+// one digest challenge.
+func (r *UplinkRegistrar) register(ctx context.Context, expiry time.Duration) error {
+	recipient := sip.Uri{Host: r.cfg.Host}
 	// Omit default port from URI (some servers strip it in digest computation)
 	if r.cfg.Port != 0 && r.cfg.Port != 5060 {
 		recipient.Port = r.cfg.Port
@@ -86,74 +102,50 @@ func (r *UplinkRegistrar) register(ctx context.Context) error {
 		},
 	}
 	req.AppendHeader(&to)
-	req.AppendHeader(&r.contact)
-	expires := sip.ExpiresHeader(uint32(r.expiry.Seconds()))
+	contact := r.contact
+	req.AppendHeader(&contact)
+	expires := sip.ExpiresHeader(uint32(expiry.Seconds()))
 	req.AppendHeader(&expires)
 
 	// First attempt (no auth)
-	r.log.Debug("Sending REGISTER (no auth)")
+	r.log.Debug("Sending REGISTER (no auth)", "expires", expiry)
 	res, err := r.doRequest(ctx, req)
 	if err != nil {
 		return fmt.Errorf("REGISTER request failed: %w", err)
 	}
 
 	if res.StatusCode == 200 {
-		r.updateExpiry(res)
+		r.updateExpiry(res, expiry)
 		return nil
 	}
 
-	if res.StatusCode != 401 && res.StatusCode != 407 {
+	authHeader, respHeader := "WWW-Authenticate", "Authorization"
+	switch res.StatusCode {
+	case 401:
+	case 407:
+		authHeader, respHeader = "Proxy-Authenticate", "Proxy-Authorization"
+	default:
 		return fmt.Errorf("unexpected response: %s", res.StartLine())
 	}
 
-	// Parse challenge
-	authHeader := "WWW-Authenticate"
-	if res.StatusCode == 407 {
-		authHeader = "Proxy-Authenticate"
-	}
 	challengeHdr := res.GetHeader(authHeader)
 	if challengeHdr == nil {
 		return fmt.Errorf("no %s header in %d response", authHeader, res.StatusCode)
 	}
+	chal, err := digest.ParseChallenge(normalizeDigestPrefix(challengeHdr.Value()))
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", authHeader, err)
+	}
+	r.log.Debug("Received auth challenge", "realm", chal.Realm, "algorithm", chal.Algorithm, "qop", chal.QOP)
 
-	challenge := parseDigestParams(challengeHdr.Value())
-	realm := challenge["realm"]
-	nonce := challenge["nonce"]
-	algorithm := challenge["algorithm"]
-
-	r.log.Debug("Received auth challenge",
-		"realm", realm,
-		"nonce", nonce,
-		"algorithm", algorithm,
-	)
-
-	// Compute digest response
-	username := r.cfg.Username
-	password := r.cfg.Password
-	uri := req.Recipient.Addr()
-
-	ha1 := md5hex(username + ":" + realm + ":" + password)
-	ha2 := md5hex("REGISTER:" + uri)
-	response := md5hex(ha1 + ":" + nonce + ":" + ha2)
-
-	r.log.Debug("Digest computation",
-		"username", username,
-		"realm", realm,
-		"uri", uri,
-		"ha1", ha1,
-		"ha2", ha2,
-		"response", response,
-	)
-
-	// Build Authorization header
-	authValue := fmt.Sprintf(
-		`Digest username="%s", realm="%s", nonce="%s", uri="%s", algorithm=MD5, response="%s"`,
-		username, realm, nonce, uri, response,
-	)
-
-	respHeader := "Authorization"
-	if res.StatusCode == 407 {
-		respHeader = "Proxy-Authorization"
+	cred, err := digest.Digest(chal, digest.Options{
+		Method:   "REGISTER",
+		URI:      req.Recipient.Addr(),
+		Username: r.cfg.Username,
+		Password: r.cfg.Password,
+	})
+	if err != nil {
+		return fmt.Errorf("digest: %w", err)
 	}
 
 	// Update Contact based on rport/received from response Via
@@ -163,74 +155,19 @@ func (r *UplinkRegistrar) register(ctx context.Context) error {
 	// Reusing the same branch makes the server treat this as a retransmission
 	// of the unauthenticated request, ignoring the Authorization header.
 	req.RemoveHeader("Via")
-
-	// Send authenticated request
 	req.RemoveHeader(respHeader)
-	req.AppendHeader(sip.NewHeader(respHeader, authValue))
+	req.AppendHeader(sip.NewHeader(respHeader, cred.String()))
 
 	r.log.Debug("Sending REGISTER (with auth)")
 	res, err = r.doRequest(ctx, req)
 	if err != nil {
 		return fmt.Errorf("authenticated REGISTER failed: %w", err)
 	}
-
-	if res.StatusCode == 200 {
-		r.updateExpiry(res)
-		return nil
+	if res.StatusCode != 200 {
+		return fmt.Errorf("registration rejected: %s", res.StartLine())
 	}
-
-	return fmt.Errorf("registration rejected: %s", res.StartLine())
-}
-
-func (r *UplinkRegistrar) unregister(ctx context.Context) {
-	recipient := sip.Uri{Host: r.cfg.Host}
-	if r.cfg.Port != 0 && r.cfg.Port != 5060 {
-		recipient.Port = r.cfg.Port
-	}
-
-	req := sip.NewRequest(sip.REGISTER, recipient)
-	contact := r.contact
-	req.AppendHeader(&contact)
-	expires := sip.ExpiresHeader(0)
-	req.AppendHeader(&expires)
-
-	res, err := r.doRequest(ctx, req)
-	if err != nil {
-		r.log.Error("Unregister failed", "err", err)
-		return
-	}
-
-	if res.StatusCode == 401 || res.StatusCode == 407 {
-		// Need auth for unregister too
-		authHeader := "WWW-Authenticate"
-		respHeader := "Authorization"
-		if res.StatusCode == 407 {
-			authHeader = "Proxy-Authenticate"
-			respHeader = "Proxy-Authorization"
-		}
-		challengeHdr := res.GetHeader(authHeader)
-		if challengeHdr != nil {
-			challenge := parseDigestParams(challengeHdr.Value())
-			uri := req.Recipient.Addr()
-			ha1 := md5hex(r.cfg.Username + ":" + challenge["realm"] + ":" + r.cfg.Password)
-			ha2 := md5hex("REGISTER:" + uri)
-			response := md5hex(ha1 + ":" + challenge["nonce"] + ":" + ha2)
-			authValue := fmt.Sprintf(
-				`Digest username="%s", realm="%s", nonce="%s", uri="%s", algorithm=MD5, response="%s"`,
-				r.cfg.Username, challenge["realm"], challenge["nonce"], uri, response,
-			)
-			r.updateContactFromVia(res, req)
-			req.RemoveHeader(respHeader)
-			req.AppendHeader(sip.NewHeader(respHeader, authValue))
-			res, err = r.doRequest(ctx, req)
-		}
-	}
-
-	if err != nil {
-		r.log.Error("Unregister auth failed", "err", err)
-	} else {
-		r.log.Info("Unregistered", "status", res.StatusCode)
-	}
+	r.updateExpiry(res, expiry)
+	return nil
 }
 
 func (r *UplinkRegistrar) doRequest(ctx context.Context, req *sip.Request) (*sip.Response, error) {
@@ -269,9 +206,13 @@ func (r *UplinkRegistrar) updateContactFromVia(res *sip.Response, req *sip.Reque
 	}
 }
 
-func (r *UplinkRegistrar) updateExpiry(res *sip.Response) {
+// updateExpiry takes over the expiry the server granted. Skipped for unregister.
+func (r *UplinkRegistrar) updateExpiry(res *sip.Response, requested time.Duration) {
+	if requested == 0 {
+		return
+	}
 	if h := res.GetHeader("Expires"); h != nil {
-		if val, err := strconv.Atoi(h.Value()); err == nil {
+		if val, err := strconv.Atoi(h.Value()); err == nil && val > 0 {
 			r.expiry = time.Duration(val) * time.Second
 		}
 	}

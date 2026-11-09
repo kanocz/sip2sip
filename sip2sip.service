@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=sip2sip
+Group=sip2sip
 WorkingDirectory=/opt/sip2sip
 ExecStart=/opt/sip2sip/sip2sip -config /opt/sip2sip/config.json
 ExecReload=/bin/kill -HUP $MAINPID

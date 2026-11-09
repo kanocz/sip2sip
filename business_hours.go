@@ -1,13 +1,41 @@
 package main
 
 import (
-	"strconv"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
 
+var weekdays = map[string]bool{"mon": true, "tue": true, "wed": true, "thu": true, "fri": true, "sat": true, "sun": true}
+
+// validate rejects a schedule that could never match or cannot be parsed.
+func (c *BusinessHoursConfig) validate() error {
+	if len(c.Days) == 0 {
+		return errors.New("days is empty")
+	}
+	for _, d := range c.Days {
+		if !weekdays[strings.ToLower(d)] {
+			return fmt.Errorf("unknown day %q (use mon..sun)", d)
+		}
+	}
+	start, err := parseHHMM(c.StartTime)
+	if err != nil {
+		return fmt.Errorf("start_time: %w", err)
+	}
+	end, err := parseHHMM(c.EndTime)
+	if err != nil {
+		return fmt.Errorf("end_time: %w", err)
+	}
+	if end <= start {
+		return fmt.Errorf("end_time %s is not after start_time %s", c.EndTime, c.StartTime)
+	}
+	return nil
+}
+
 // IsWithinBusinessHours checks if current time is within configured business hours.
 // Returns true if business hours checking is disabled (all calls accepted).
+// The schedule is validated in LoadConfig, so parse errors cannot happen here.
 func IsWithinBusinessHours(cfg *BusinessHoursConfig) bool {
 	if !cfg.Enabled {
 		return true
@@ -33,25 +61,19 @@ func IsWithinBusinessHours(cfg *BusinessHoursConfig) bool {
 		return false
 	}
 
-	// Check time of day
-	startH, startM := parseTimeStr(cfg.StartTime)
-	endH, endM := parseTimeStr(cfg.EndTime)
-
+	start, _ := parseHHMM(cfg.StartTime)
+	end, _ := parseHHMM(cfg.EndTime)
 	nowMinutes := now.Hour()*60 + now.Minute()
-	startMinutes := startH*60 + startM
-	endMinutes := endH*60 + endM
-
-	return nowMinutes >= startMinutes && nowMinutes < endMinutes
+	return nowMinutes >= start && nowMinutes < end
 }
 
-func parseTimeStr(t string) (int, int) {
-	parts := strings.Split(t, ":")
-	if len(parts) != 2 {
-		return 0, 0
+// parseHHMM returns minutes since midnight for a strict "HH:MM" string.
+func parseHHMM(s string) (int, error) {
+	t, err := time.Parse("15:04", s)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not HH:MM", s)
 	}
-	h, _ := strconv.Atoi(parts[0])
-	m, _ := strconv.Atoi(parts[1])
-	return h, m
+	return t.Hour()*60 + t.Minute(), nil
 }
 
 const dateLayout = "2006-01-02"

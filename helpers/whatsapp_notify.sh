@@ -34,11 +34,21 @@ if [ -z "$CDR_JSON" ] || [ ! -f "$CDR_JSON" ]; then
     exit 1
 fi
 
-API="https://graph.facebook.com/v21.0/${WHATSAPP_PHONE_ID}"
+# curl reads the URL and the bearer header from stdin (-K -), not from argv,
+# so the token does not show up in `ps` for other local users.
+wa() {
+    local path="$1"; shift
+    curl -s -X POST -K - "$@" <<EOF
+url = "https://graph.facebook.com/v21.0/${WHATSAPP_PHONE_ID}/${path}"
+header = "Authorization: Bearer ${WHATSAPP_TOKEN}"
+EOF
+}
 
-# Parse CDR fields
-CALLER=$(jq -r '.caller_number' "$CDR_JSON")
-CALLED=$(jq -r '.called_number' "$CDR_JSON")
+# Parse CDR fields. Numbers come from the network: keep only digits, + - ( )
+# so they can never be read by curl as a file reference.
+CALLER=$(jq -r '.caller_number // ""' "$CDR_JSON" | tr -cd '0-9+()-')
+CALLED=$(jq -r '.called_number // ""' "$CDR_JSON" | tr -cd '0-9+()-')
+CALLER="${CALLER:-neznamy}"
 DIRECTION=$(jq -r '.direction' "$CDR_JSON")
 ANSWERED=$(jq -r '.answered' "$CDR_JSON")
 ANSWERED_BY=$(jq -r '.answered_by // empty' "$CDR_JSON")
@@ -50,6 +60,7 @@ MSG_DURATION=$(jq -r '.message_duration_seconds // 0 | floor' "$CDR_JSON")
 # Czech label for voicemail_reason; unknown values are shown as is
 REASON=$(jq -r '{vacation: "dovolena", outside_hours: "mimo pracovni dobu", unavailable: "nikdo neni k dispozici"}[.voicemail_reason // ""] // .voicemail_reason // empty' "$CDR_JSON")
 START_TIME=$(jq -r '.start_time | split(".")[0] | gsub("T";" ")' "$CDR_JSON")
+ERROR=$(jq -r '.error // empty' "$CDR_JSON")
 
 # Format message
 if [ "$VOICEMAIL" = "true" ]; then
@@ -76,9 +87,14 @@ Od: ${CALLER}
 Cas: ${START_TIME}"
 fi
 
+# A failed recording or voicemail is worth a line of its own: the audio is missing, not just late
+if [ -n "$ERROR" ]; then
+    MSG="CHYBA: ${ERROR}
+${MSG}"
+fi
+
 # Send text message
-curl -s -X POST "$API/messages" \
-    -H "Authorization: Bearer $WHATSAPP_TOKEN" \
+wa messages \
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg to "$WHATSAPP_TO" --arg body "$MSG" '{
         messaging_product: "whatsapp",
@@ -100,8 +116,7 @@ if [ "$WAV_FILE" != "none" ] && [ -f "$WAV_FILE" ]; then
     }
 
     # Upload media first
-    MEDIA_ID=$(curl -s -X POST "$API/media" \
-        -H "Authorization: Bearer $WHATSAPP_TOKEN" \
+    MEDIA_ID=$(wa media \
         -F messaging_product=whatsapp \
         -F type=audio/ogg \
         -F file=@"$OGG_FILE" \
@@ -109,8 +124,7 @@ if [ "$WAV_FILE" != "none" ] && [ -f "$WAV_FILE" ]; then
 
     if [ -n "$MEDIA_ID" ]; then
         # Send audio message
-        curl -s -X POST "$API/messages" \
-            -H "Authorization: Bearer $WHATSAPP_TOKEN" \
+        wa messages \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg to "$WHATSAPP_TO" --arg id "$MEDIA_ID" '{
                 messaging_product: "whatsapp",
