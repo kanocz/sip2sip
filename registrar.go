@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
@@ -27,10 +26,11 @@ const nonceLifetime = 5 * time.Minute
 const maxRegisterExpiry = 120
 
 type Registration struct {
-	Username string
-	Contact  sip.ContactHeader
-	Source   string // ip:port of the registering device
-	Expires  time.Time
+	Username  string
+	Contact   sip.ContactHeader
+	Source    string // ip:port of the registering device
+	Transport string // udp, tcp or tls: calls to the phone go over the connection it registered on
+	Expires   time.Time
 }
 
 type nonceEntry struct {
@@ -98,12 +98,13 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 		r.log.Info("User unregistered", "user", username)
 	} else {
 		r.registrations[username] = &Registration{
-			Username: username,
-			Contact:  *contact,
-			Source:   req.Source(),
-			Expires:  time.Now().Add(time.Duration(expiry) * time.Second),
+			Username:  username,
+			Contact:   *contact,
+			Source:    req.Source(),
+			Transport: strings.ToLower(req.Transport()),
+			Expires:   time.Now().Add(time.Duration(expiry) * time.Second),
 		}
-		r.log.Info("User registered", "user", username, "contact", contact.Address.String(), "source", req.Source(), "expires", expiry)
+		r.log.Info("User registered", "user", username, "contact", contact.Address.String(), "source", req.Source(), "transport", req.Transport(), "expires", expiry)
 	}
 	r.mu.Unlock()
 
@@ -347,16 +348,16 @@ func (r *Registrar) IsLocalUser(username string) bool {
 	return ok
 }
 
-// ContactURI builds a SIP URI for reaching a registered user.
+// ContactURI builds a SIP URI for reaching a registered user: the address the
+// REGISTER came from, so NAT is no concern, over the same transport.
 func (r *Registrar) ContactURI(reg *Registration) sip.Uri {
 	host, port, _ := net.SplitHostPort(reg.Source)
-	p := 0
-	fmt.Sscanf(port, "%d", &p)
-	return sip.Uri{
-		User: reg.Username,
-		Host: host,
-		Port: p,
+	p, _ := strconv.Atoi(port)
+	u := sip.Uri{User: reg.Username, Host: host, Port: p, UriParams: sip.NewParams()}
+	if reg.Transport != "" && reg.Transport != "udp" {
+		u.UriParams.Add("transport", reg.Transport)
 	}
+	return u
 }
 
 func (r *Registrar) respond(req *sip.Request, tx sip.ServerTransaction, code int, reason string) {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,7 +95,7 @@ func (h *CallHandler) HandleInvite(inDialog *diago.DialogServerSession) {
 	fromUser := inDialog.FromUser()
 	toUser := inDialog.ToUser()
 	source := inDialog.InviteRequest.Source()
-	fromUplink := h.isFromUplink(inDialog)
+	fromUplink := h.isFromUplink(inDialog.InviteRequest)
 
 	// uplink=false with the provider's address here means the provider sends
 	// INVITEs from a host other than uplink.host.
@@ -140,10 +141,11 @@ func (h *CallHandler) HandleInvite(inDialog *diago.DialogServerSession) {
 	h.handleOutgoing(inDialog, fromUser, toUser)
 }
 
-// isFromUplink checks if the INVITE came from the uplink server's IP.
-func (h *CallHandler) isFromUplink(inDialog *diago.DialogServerSession) bool {
-	source := inDialog.InviteRequest.Source()
-	sourceHost, _, err := net.SplitHostPort(source)
+// isFromUplink reports whether req came from the uplink server: its IP, over
+// the transport uplink.transport names. The transport matters because a UDP
+// source address can be forged from anywhere, a TCP or TLS connection cannot.
+func (h *CallHandler) isFromUplink(req *sip.Request) bool {
+	sourceHost, _, err := net.SplitHostPort(req.Source())
 	if err != nil {
 		return false
 	}
@@ -151,12 +153,25 @@ func (h *CallHandler) isFromUplink(inDialog *diago.DialogServerSession) bool {
 	if sourceIP == nil {
 		return false
 	}
+	match := false
 	for _, ip := range *h.uplinkIPs.Load() {
 		if ip.Equal(sourceIP) {
-			return true
+			match = true
+			break
 		}
 	}
-	return false
+	if !match {
+		return false
+	}
+	// Only UDP is forgeable, so only UDP is refused when the uplink is on tcp or
+	// tls. A provider on UDP that switches a large INVITE to TCP (RFC 3261 18.1.1)
+	// is still the provider.
+	want := h.getConfig().Uplink.Transport
+	if got := strings.ToLower(req.Transport()); got == "udp" && want != "udp" {
+		h.log.Warn("INVITE from the uplink IP over UDP while uplink.transport is not udp, challenged like a phone", "source", req.Source(), "uplink_transport", want)
+		return false
+	}
+	return true
 }
 
 // handleIncoming handles calls from external (uplink) - fork to all registered phones.
@@ -389,6 +404,7 @@ func (h *CallHandler) handleInternalCall(inDialog *diago.DialogServerSession, ca
 
 	outDialog, outMed, err := h.dg.Invite(ctx, uri, diago.InviteOptions{
 		Originator: inDialog,
+		Transport:  reg.Transport,
 		RTPNAT:     media.RTPNATSymetric,
 	})
 	if err != nil {
@@ -421,13 +437,11 @@ func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, call
 	cfg := h.getConfig()
 	inDialog.Ringing()
 
-	uplinkURI := sip.Uri{
-		User: calledNum,
-		Host: cfg.Uplink.Host,
-		Port: cfg.Uplink.Port,
-	}
+	// No ;transport= in the URI: the transport goes through InviteOptions, and
+	// the digest uri= sipgo computes has no parameters, so the Request-URI must not either.
+	target := sip.Uri{User: calledNum, Host: cfg.Uplink.Host, Port: cfg.Uplink.Port}
 
-	log.Info("Outgoing call via uplink", "uri", uplinkURI.String())
+	log.Info("Outgoing call via uplink", "uri", target.String(), "transport", cfg.Uplink.Transport)
 
 	ctx, cancel := context.WithTimeout(inDialog.Context(), 60*time.Second)
 	defer cancel()
@@ -444,10 +458,11 @@ func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, call
 	}
 	from.Params.Remove("tag")
 
-	outDialog, outMed, err := h.dg.Invite(ctx, uplinkURI, diago.InviteOptions{
-		Username: cfg.Uplink.Username,
-		Password: cfg.Uplink.Password,
-		Headers:  []sip.Header{from},
+	outDialog, outMed, err := h.dg.Invite(ctx, target, diago.InviteOptions{
+		Transport: cfg.Uplink.Transport,
+		Username:  cfg.Uplink.Username,
+		Password:  cfg.Uplink.Password,
+		Headers:   []sip.Header{from},
 	})
 	if err != nil {
 		log.Warn("Uplink call failed", "err", err)
@@ -497,7 +512,7 @@ func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Regi
 	for _, reg := range regs {
 		uri := h.registrar.ContactURI(reg)
 		wg.Add(1)
-		go func(u sip.Uri, username string) {
+		go func(u sip.Uri, username, transport string) {
 			defer wg.Done()
 
 			log.Info("Inviting phone", "user", username, "uri", u.String())
@@ -507,6 +522,7 @@ func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Regi
 			// real source from the first packet is harmless for the LAN one.
 			d, med, err := h.dg.Invite(ctx, u, diago.InviteOptions{
 				Originator: inDialog,
+				Transport:  transport,
 				RTPNAT:     media.RTPNATSymetric,
 			})
 			if err != nil {
@@ -526,7 +542,7 @@ func (h *CallHandler) forkCall(inDialog *diago.DialogServerSession, regs []*Regi
 				med.Close()
 				d.Close()
 			}
-		}(uri, reg.Username)
+		}(uri, reg.Username, reg.Transport)
 	}
 
 	wg.Wait()

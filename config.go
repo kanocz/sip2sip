@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -25,9 +26,12 @@ type Config struct {
 
 type SIPConfig struct {
 	ListenAddr   string `json:"listen_addr"`
-	ListenPort   int    `json:"listen_port"`
+	ListenPort   int    `json:"listen_port"`   // UDP and TCP
 	ExternalIP   string `json:"external_ip"`   // public IP for NAT
 	ExternalPort int    `json:"external_port"` // public SIP port (default: listen_port)
+	TLSPort      int    `json:"tls_port"`      // TLS listener, default 5061; needs tls_cert and tls_key
+	TLSCert      string `json:"tls_cert"`      // PEM certificate chain; empty disables the TLS listener
+	TLSKey       string `json:"tls_key"`       // PEM private key
 	RTPPortMin   int    `json:"rtp_port_min"`
 	RTPPortMax   int    `json:"rtp_port_max"`
 }
@@ -37,6 +41,7 @@ type UplinkConfig struct {
 	Port           int    `json:"port"`
 	Username       string `json:"username"`
 	Password       string `json:"password"`
+	Transport      string `json:"transport"`        // udp (default), tcp or tls
 	Expiry         int    `json:"expiry"`           // seconds
 	FilterCalledNo bool   `json:"filter_called_no"` // only accept calls to our registered number
 }
@@ -116,6 +121,7 @@ func LoadConfig(path string) (*Config, error) {
 		SIP: SIPConfig{
 			ListenAddr: "0.0.0.0",
 			ListenPort: 5060,
+			TLSPort:    5061,
 			RTPPortMin: 10000,
 			RTPPortMax: 10200,
 		},
@@ -125,6 +131,7 @@ func LoadConfig(path string) (*Config, error) {
 			Window:     300,
 			BlockTime:  3600,
 		},
+		Uplink:   UplinkConfig{Transport: "udp"},
 		MaxCalls: 3,
 		Dialplan: DialplanConfig{
 			InternalMaxDigits: 3,
@@ -147,6 +154,30 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Uplink.Username == "" {
 		return nil, fmt.Errorf("uplink.username is required")
+	}
+	cfg.Uplink.Transport = strings.ToLower(cfg.Uplink.Transport)
+	switch cfg.Uplink.Transport {
+	case "":
+		cfg.Uplink.Transport = "udp"
+	case "udp", "tcp", "tls":
+	default:
+		return nil, fmt.Errorf("uplink.transport must be udp, tcp or tls, got %q", cfg.Uplink.Transport)
+	}
+	if (cfg.SIP.TLSCert == "") != (cfg.SIP.TLSKey == "") {
+		return nil, fmt.Errorf("sip.tls_cert and sip.tls_key must be set together")
+	}
+	if cfg.SIP.TLSCert != "" && (cfg.SIP.TLSPort <= 0 || cfg.SIP.TLSPort == cfg.SIP.ListenPort) {
+		return nil, fmt.Errorf("sip.tls_port must be positive and differ from sip.listen_port")
+	}
+	// Outgoing INVITEs go through diago, which has a TLS transport only when it
+	// also listens on it; REGISTER alone would work and the failure would show
+	// up on the first outgoing call.
+	if cfg.Uplink.Transport == "tls" && cfg.SIP.TLSCert == "" {
+		return nil, fmt.Errorf("uplink.transport tls needs sip.tls_cert and sip.tls_key")
+	}
+	// The example config carries port 5060; a provider's TLS usually lives on 5061.
+	if cfg.Uplink.Transport == "tls" && cfg.Uplink.Port == 5060 {
+		slog.Warn("uplink.port is 5060 with transport tls; providers usually serve TLS on 5061, check if registration fails")
 	}
 	if len(cfg.Users) == 0 {
 		return nil, fmt.Errorf("at least one user is required")

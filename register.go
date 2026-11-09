@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -81,16 +82,33 @@ func (r *UplinkRegistrar) Run(ctx context.Context) {
 	}
 }
 
+// uplinkContact is the Contact we register on the provider: our external
+// address on the uplink transport. tcp is named by a parameter; for tls the
+// sips: scheme says so by itself, the same form diago puts in dialog Contacts.
+func uplinkContact(cfg *Config) sip.ContactHeader {
+	u := sip.Uri{Scheme: "sip", User: cfg.Uplink.Username, Host: cfg.SIP.ExternalIP, Port: cfg.SIP.ExternalPort, UriParams: sip.NewParams()}
+	switch cfg.Uplink.Transport {
+	case "tcp":
+		u.UriParams.Add("transport", "tcp")
+	case "tls":
+		u.Scheme, u.Port = "sips", cfg.SIP.TLSPort
+	}
+	return sip.ContactHeader{Address: u}
+}
+
 // register sends REGISTER with the given expiry (0 unregisters) and answers
 // one digest challenge.
 func (r *UplinkRegistrar) register(ctx context.Context, expiry time.Duration) error {
-	recipient := sip.Uri{Host: r.cfg.Host}
+	recipient := sip.Uri{Host: r.cfg.Host, Port: r.cfg.Port}
 	// Omit default port from URI (some servers strip it in digest computation)
-	if r.cfg.Port != 0 && r.cfg.Port != 5060 {
-		recipient.Port = r.cfg.Port
+	if recipient.Port == sip.DefaultPort(r.cfg.Transport) {
+		recipient.Port = 0
 	}
 
 	req := sip.NewRequest(sip.REGISTER, recipient)
+	// The transport is set on the request, not as ;transport= in the URI, so the
+	// Request-URI and the digest uri= (Addr(), no parameters) stay identical.
+	req.SetTransport(strings.ToUpper(r.cfg.Transport))
 
 	// To header must include the username (AOR) — many servers
 	// check that To matches the authenticated user and reject with 403 otherwise.
@@ -195,7 +213,11 @@ func (r *UplinkRegistrar) updateContactFromVia(res *sip.Response, req *sip.Reque
 
 	contact := r.contact
 	if rport, _ := via.Params.Get("rport"); rport != "" {
-		if p, err := strconv.Atoi(rport); err == nil {
+		// On UDP rport is the NAT mapping of our listener, which is where the
+		// provider has to send INVITEs. On TCP or TLS it is the ephemeral port of
+		// this connection: a provider that reuses the connection does not need
+		// it, one that opens its own must reach the listener port instead.
+		if p, err := strconv.Atoi(rport); err == nil && !sip.IsReliable(r.cfg.Transport) {
 			contact.Address.Port = p
 		}
 		if received, _ := via.Params.Get("received"); received != "" {

@@ -41,20 +41,38 @@ cp config.example.json config.json
 | Parameter | Description | Default |
 |---|---|---|
 | `sip.listen_addr` | Bind address | `0.0.0.0` |
-| `sip.listen_port` | SIP port | `5060` |
+| `sip.listen_port` | SIP port, UDP and TCP | `5060` |
 | `sip.external_ip` | Public IP for NAT traversal | — |
 | `sip.external_port` | External SIP port as seen from internet | `listen_port` |
+| `sip.tls_port` | SIP over TLS port, listened on when `tls_cert` is set; also the external port for TLS | `5061` |
+| `sip.tls_cert` | PEM certificate chain for the TLS listener; empty means no TLS listener | — |
+| `sip.tls_key` | PEM private key for `tls_cert` | — |
 | `sip.rtp_port_min` | RTP media port range start | `10000` |
 | `sip.rtp_port_max` | RTP media port range end | `10200` |
+
+UDP and TCP are always on. Phones pick one in their account settings; a phone registered over TCP is called back over the same connection, so a phone behind NAT keeps working as long as its periodic REGISTER keeps the connection open. RTP stays on UDP whatever the SIP transport.
+
+### TLS
+
+The certificate is an ordinary X.509 pair, the same kind an HTTPS server uses; Let's Encrypt works. Phones connect by the hostname the certificate is issued for, on `tls_port`, and verify it against their CA store. The files must be readable by the `sip2sip` user, which Let's Encrypt's `/etc/letsencrypt/archive` is not by default.
+
+The files are checked once an hour and on `SIGHUP`; when either changed, the pair is loaded again without a restart. A pair that fails to load is logged and the previous one stays in use.
+
+Talking TLS to the provider (`uplink.transport: tls`) also needs `tls_cert` and `tls_key`: outgoing calls go through diago, which only has a TLS transport when it listens on one. The provider's certificate is verified against the system CA store. Contacts on the TLS transport, ours in REGISTER and diago's in dialogs, are `sips:` URIs, which mandate TLS on their own. They name `external_ip`, not the certificate's hostname, so incoming TLS traffic relies on the peer reusing the connection we or the phone opened; a peer that opens a fresh connection to the Contact and verifies the certificate against the IP will fail. Note for setups behind NAT: Contact headers built for TCP carry no `transport=` parameter when `listen_addr` differs from `external_ip` (a diago limitation), so a BYE from the other side can arrive over UDP 5060; that listener is always on, so the call still ends correctly.
+
+One sipgo client serves every transport, so the Via header on TLS requests names `external_port`, not `tls_port`. Responses on TCP and TLS come back on the connection the request went out on, so this only matters to a peer that opens a new connection to the Via address, which would land on TCP `external_port` without TLS.
+
+With `uplink.transport` set to `tcp` or `tls`, the Contact we register on the provider names `external_port` (or `tls_port`), not the ephemeral port of our outgoing connection. A provider that reuses our connection for incoming INVITEs needs nothing else; one that opens its own connection reaches us on the forwarded port.
 
 ### Uplink (external SIP server)
 
 | Parameter | Description | Default |
 |---|---|---|
 | `uplink.host` | SIP server hostname | — (required) |
-| `uplink.port` | SIP server port | `5060` |
+| `uplink.port` | SIP server port. Omitted, the transport default applies: `5060`, or `5061` for `tls`. The example sets `5060`, so remove or change it when switching to `tls` | transport default |
 | `uplink.username` | SIP account username | — (required) |
 | `uplink.password` | SIP account password | — |
+| `uplink.transport` | `udp`, `tcp` or `tls`. With `tcp` or `tls`, an INVITE from the provider's IP over UDP is not trusted: a UDP source address can be forged, a TCP connection cannot | `udp` |
 | `uplink.expiry` | Registration expiry (seconds) | `300` |
 | `uplink.filter_called_no` | Only accept calls addressed to our registered number | `false` |
 
@@ -203,6 +221,8 @@ If the server is behind NAT, forward these ports:
 | Port | Protocol | Purpose |
 |---|---|---|
 | `5060` | **UDP** | SIP signaling |
+| `5060` | **TCP** | SIP signaling |
+| `5061` | **TCP** | SIP over TLS, only if `sip.tls_cert` is set |
 | `10000-10200` | **UDP** | RTP media (audio) |
 
 Set `sip.external_ip` to your public IP.
@@ -269,7 +289,7 @@ The `sip` section and the uplink host, port and credentials are fixed at startup
 
 An INVITE is accepted from two places only:
 
-- **The uplink server's IP** (`uplink.host`, resolved at startup, on reload and once an hour): treated as an incoming call. With **`filter_called_no`** (recommended) a call whose To number is not `uplink.username` is rejected with 404, which stops scanners dialing random numbers. If the provider sends INVITEs from a server other than `uplink.host`, they are challenged instead of connected; the log line `Incoming INVITE ... uplink=false` with the provider's address is what to look for when incoming calls stop.
+- **The uplink server's IP** (`uplink.host`, resolved at startup, on reload and once an hour), treated as an incoming call. With `uplink.transport` set to `tcp` or `tls`, an INVITE from that IP over UDP is challenged like a phone instead and logged with `over UDP while uplink.transport is not udp`. With **`filter_called_no`** (recommended) a call whose To number is not `uplink.username` is rejected with 404, which stops scanners dialing random numbers. If the provider sends INVITEs from a server other than `uplink.host`, they are challenged instead of connected; the log line `Incoming INVITE ... uplink=false` with the provider's address is what to look for when incoming calls stop.
 - **Anywhere else**: challenged with digest auth (401) and treated as an outgoing call from the extension named in From. Without the extension's password it goes nowhere.
 
 An uplink call whose caller number happens to equal a local extension is logged and still treated as incoming.
@@ -411,7 +431,7 @@ Configure your SIP phone/app (Linphone, MicroSIP, Otwrt, etc.):
 | **SIP Port** | `5060` |
 | **Username** | Extension number (e.g. `100`) |
 | **Password** | Password from config |
-| **Transport** | UDP |
+| **Transport** | UDP or TCP; TLS when `sip.tls_cert` is set (then use the certificate's hostname and `tls_port`) |
 
 ## Codecs
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log/slog"
 	"os"
@@ -101,26 +102,38 @@ func main() {
 		tx.Respond(res)
 	})
 
-	// Single transport — server listens here, Contact headers use external IP/port
-	transport := diago.Transport{
-		Transport: "udp",
-		BindHost:  cfg.SIP.ListenAddr,
-		BindPort:  cfg.SIP.ListenPort,
+	// UDP and TCP share listen_port; TLS is on when a certificate is configured.
+	// Contact headers use the external IP/port of each transport.
+	transports := []diago.Transport{
+		{Transport: "udp", BindHost: cfg.SIP.ListenAddr, BindPort: cfg.SIP.ListenPort, ExternalHost: cfg.SIP.ExternalIP, ExternalPort: cfg.SIP.ExternalPort},
+		{Transport: "tcp", BindHost: cfg.SIP.ListenAddr, BindPort: cfg.SIP.ListenPort, ExternalHost: cfg.SIP.ExternalIP, ExternalPort: cfg.SIP.ExternalPort},
 	}
-	if cfg.SIP.ExternalIP != "" {
-		transport.ExternalHost = cfg.SIP.ExternalIP
-	}
-	if cfg.SIP.ExternalPort > 0 {
-		transport.ExternalPort = cfg.SIP.ExternalPort
+	var certs *certWatcher
+	if cfg.SIP.TLSCert != "" {
+		certs, err = newCertWatcher(cfg.SIP.TLSCert, cfg.SIP.TLSKey, log.With("component", "tls"))
+		if err != nil {
+			log.Error("Failed to load TLS certificate", "err", err)
+			os.Exit(1)
+		}
+		transports = append(transports, diago.Transport{
+			Transport: "tls", BindHost: cfg.SIP.ListenAddr, BindPort: cfg.SIP.TLSPort, ExternalHost: cfg.SIP.ExternalIP, ExternalPort: cfg.SIP.TLSPort,
+			// Contacts on this transport are sips: URIs. diago adds ;transport= only
+			// when listen_addr equals external_ip, and a plain sip:host:5061 without
+			// it means UDP to the peer, where nothing listens.
+			TLSConf: &tls.Config{GetCertificate: certs.get, MinVersion: tls.VersionTLS12},
+		})
 	}
 
 	// Create Diago instance with our server and client
-	dg := diago.NewDiago(ua,
+	opts := []diago.DiagoOption{
 		diago.WithServer(srv),
 		diago.WithClient(client),
-		diago.WithTransport(transport),
 		diago.WithLogger(log.With("component", "diago")),
-	)
+	}
+	for _, t := range transports {
+		opts = append(opts, diago.WithTransport(t))
+	}
+	dg := diago.NewDiago(ua, opts...)
 
 	// Create call handler
 	handler := NewCallHandler(dg, registrar, cfg, log.With("component", "calls"))
@@ -142,10 +155,10 @@ func main() {
 				}
 				// The uplink registration and the SIP transport were built from the
 				// startup config; outgoing calls must keep using the same account.
-				if newCfg.Uplink.Host != cfg.Uplink.Host || newCfg.Uplink.Port != cfg.Uplink.Port ||
+				if newCfg.Uplink.Host != cfg.Uplink.Host || newCfg.Uplink.Port != cfg.Uplink.Port || newCfg.Uplink.Transport != cfg.Uplink.Transport ||
 					newCfg.Uplink.Username != cfg.Uplink.Username || newCfg.Uplink.Password != cfg.Uplink.Password {
-					log.Warn("uplink host/port/credentials changed: restart required, keeping the old values")
-					newCfg.Uplink.Host, newCfg.Uplink.Port = cfg.Uplink.Host, cfg.Uplink.Port
+					log.Warn("uplink host/port/transport/credentials changed: restart required, keeping the old values")
+					newCfg.Uplink.Host, newCfg.Uplink.Port, newCfg.Uplink.Transport = cfg.Uplink.Host, cfg.Uplink.Port, cfg.Uplink.Transport
 					newCfg.Uplink.Username, newCfg.Uplink.Password = cfg.Uplink.Username, cfg.Uplink.Password
 				}
 				if newCfg.SIP != cfg.SIP {
@@ -154,6 +167,9 @@ func main() {
 				}
 				handler.UpdateConfig(newCfg)
 				registrar.UpdateConfig(newCfg)
+				if certs != nil {
+					certs.reload()
+				}
 				log.Info("Configuration reloaded", "users", len(newCfg.Users))
 				continue
 			}
@@ -169,19 +185,13 @@ func main() {
 		log.Error("Failed to start server", "err", err)
 		os.Exit(1)
 	}
+	if certs != nil {
+		go certs.watch(ctx)
+	}
 
 	// Register on uplink using our own registration handler.
 	// This gives us full control over digest auth and debug output.
-	uplinkContact := sip.ContactHeader{
-		Address: sip.Uri{
-			Scheme: "sip",
-			User:   cfg.Uplink.Username,
-			Host:   cfg.SIP.ExternalIP,
-			Port:   cfg.SIP.ExternalPort,
-		},
-	}
-
-	uplinkReg := NewUplinkRegistrar(client, &cfg.Uplink, uplinkContact, log.With("component", "uplink"))
+	uplinkReg := NewUplinkRegistrar(client, &cfg.Uplink, uplinkContact(cfg), log.With("component", "uplink"))
 
 	log.Info("Registering on uplink", "host", cfg.Uplink.Host, "user", cfg.Uplink.Username)
 	uplinkReg.Run(ctx)

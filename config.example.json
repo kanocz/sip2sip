@@ -4,6 +4,9 @@
     "listen_port": 5060,
     "external_ip": "YOUR_PUBLIC_IP",
     "external_port": 5060,
+    "tls_port": 5061,
+    "tls_cert": "",
+    "tls_key": "",
     "rtp_port_min": 10000,
     "rtp_port_max": 10200
   },
@@ -12,6 +15,7 @@
     "port": 5060,
     "username": "your_sip_username",
     "password": "your_sip_password",
+    "transport": "udp",
     "expiry": 300,
     "filter_called_no": true
   },

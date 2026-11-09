@@ -273,3 +273,17 @@ func TestAuthorizeRejectsRewrittenRequestURI(t *testing.T) {
 		t.Fatalf("rewritten Request-URI must be rejected with 401, got %v", got)
 	}
 }
+
+func TestContactURICarriesTransport(t *testing.T) {
+	r := testRegistrar(t)
+	reg := &Registration{Username: "100", Source: "192.0.2.9:49152", Transport: "tcp"}
+	u := r.ContactURI(reg)
+	if got := u.String(); got != "sip:100@192.0.2.9:49152;transport=tcp" {
+		t.Fatalf("tcp registration: got %s", got)
+	}
+	reg.Transport = "udp"
+	u = r.ContactURI(reg)
+	if got := u.String(); got != "sip:100@192.0.2.9:49152" {
+		t.Fatalf("udp registration: got %s", got)
+	}
+}
