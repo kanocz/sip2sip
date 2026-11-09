@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -376,10 +378,22 @@ func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, call
 	ctx, cancel := context.WithTimeout(inDialog.Context(), 60*time.Second)
 	defer cancel()
 
+	// No Originator here: with it diago offers the uplink only the first codec
+	// from the phone's list, and the call fails if the provider doesn't support it.
+	// Without it the uplink gets our full codec list and picks one itself.
+	// Keep the phone's From, as Originator would, but with our own dialog tag.
+	origFrom := inDialog.InviteRequest.From()
+	from := &sip.FromHeader{
+		DisplayName: origFrom.DisplayName,
+		Address:     *origFrom.Address.Clone(),
+		Params:      origFrom.Params.Clone(),
+	}
+	from.Params.Remove("tag")
+
 	outDialog, err := h.dg.Invite(ctx, uplinkURI, diago.InviteOptions{
-		Originator: inDialog,
-		Username:   cfg.Uplink.Username,
-		Password:   cfg.Uplink.Password,
+		Username: cfg.Uplink.Username,
+		Password: cfg.Uplink.Password,
+		Headers:  []sip.Header{from},
 	})
 	if err != nil {
 		log.Warn("Uplink call failed", "err", err)
@@ -389,11 +403,18 @@ func (h *CallHandler) handleUplinkCall(inDialog *diago.DialogServerSession, call
 	}
 	defer outDialog.Close()
 
+	// The bridge copies RTP without transcoding, so the phone must use
+	// the same codec the uplink chose.
+	codec := media.CodecAudioFromSession(outDialog.MediaSession())
+	log.Info("Uplink codec negotiated", "codec", codec.Name)
+
 	cdr.Answered = true
 	cdr.AnswerTime = time.Now()
 
-	if err := inDialog.Answer(); err != nil {
-		log.Error("Failed to answer", "err", err)
+	if err := inDialog.AnswerOptions(diago.AnswerOptions{
+		Codecs: []media.Codec{codec, media.CodecTelephoneEvent8000},
+	}); err != nil {
+		log.Error("Failed to answer phone with uplink codec", "codec", codec.Name, "err", err)
 		outDialog.Hangup(context.Background())
 		return
 	}
@@ -500,28 +521,29 @@ func (h *CallHandler) bridgeWithRecordingState(inDialog *diago.DialogServerSessi
 		h.playAnnouncement(inDialog, outDialog, log)
 	}
 
-	// Get audio readers/writers
-	aReader, err := inDialog.AudioReader()
-	if err != nil {
-		log.Error("Failed to get audio reader for incoming side", "err", err)
-		return
-	}
-	aWriter, err := inDialog.AudioWriter()
-	if err != nil {
-		log.Error("Failed to get audio writer for incoming side", "err", err)
-		return
-	}
+	// Audio readers/writers wrapped with RFC 4733 DTMF handling.
+	// They wrap the current reader/writer, so recording (if set) stays in the chain.
+	aReader := inDialog.AudioReaderDTMF()
+	aWriter := inDialog.AudioWriterDTMF()
+	bReader := outDialog.AudioReaderDTMF()
+	bWriter := outDialog.AudioWriterDTMF()
 
-	bReader, err := outDialog.AudioReader()
-	if err != nil {
-		log.Error("Failed to get audio reader for outgoing side", "err", err)
-		return
+	// DTMF is regenerated on the other leg after the digit ends, not passed through.
+	// Raw event packets would go out with the audio payload type and turn into noise.
+	forwardDTMF := func(from string, to *diago.DTMFWriter, toMS *media.MediaSession) func(rune) error {
+		enabled := toMS != nil && slices.Contains(toMS.CommonCodecs(), media.CodecTelephoneEvent8000)
+		return func(d rune) error {
+			log.Info("DTMF", "from", from, "digit", string(d), "forwarded", enabled)
+			if enabled {
+				if err := to.WriteDTMF(d); err != nil {
+					log.Warn("DTMF forward failed", "err", err)
+				}
+			}
+			return nil
+		}
 	}
-	bWriter, err := outDialog.AudioWriter()
-	if err != nil {
-		log.Error("Failed to get audio writer for outgoing side", "err", err)
-		return
-	}
+	aReader.OnDTMF(forwardDTMF("caller", bWriter, outDialog.MediaSession()))
+	bReader.OnDTMF(forwardDTMF("callee", aWriter, inDialog.MediaSession()))
 
 	// Log media session addresses for NAT debugging
 	if inMS := inDialog.MediaSession(); inMS != nil {
@@ -535,11 +557,11 @@ func (h *CallHandler) bridgeWithRecordingState(inDialog *diago.DialogServerSessi
 	done := make(chan string, 2)
 
 	go func() {
-		media.Copy(aReader, bWriter) // A → B
+		copyAudio(aReader, inDialog.RTPPacketReader, bWriter) // A → B
 		done <- "caller"
 	}()
 	go func() {
-		media.Copy(bReader, aWriter) // B → A
+		copyAudio(bReader, outDialog.RTPPacketReader, aWriter) // B → A
 		done <- "callee"
 	}()
 
@@ -550,6 +572,24 @@ func (h *CallHandler) bridgeWithRecordingState(inDialog *diago.DialogServerSessi
 
 	outDialog.Hangup(context.Background())
 	inDialog.Hangup(context.Background())
+}
+
+// copyAudio is media.Copy that skips telephone-event packets: the reader has already
+// turned them into an OnDTMF callback, and writing them on would send them as audio.
+func copyAudio(r io.Reader, pr *media.RTPPacketReader, w io.Writer) error {
+	buf := make([]byte, media.RTPBufSize)
+	for {
+		n, err := r.Read(buf)
+		if err != nil {
+			return err
+		}
+		if n == 0 || pr.PacketHeader.PayloadType == media.CodecTelephoneEvent8000.PayloadType {
+			continue
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			return err
+		}
+	}
 }
 
 // playAnnouncement plays a WAV file to both call parties simultaneously.
