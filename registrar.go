@@ -148,9 +148,16 @@ func (r *Registrar) Authorize(req *sip.Request, username string) *sip.Response {
 	}
 
 	if authHdr := req.GetHeader("Authorization"); authHdr != nil {
-		ok, guess := r.verifyAuth(req, authHdr.Value(), username)
+		ok, guess, stale := r.verifyAuth(req, authHdr.Value(), username)
 		if ok {
 			return nil
+		}
+		if stale {
+			// Phones answer with the nonce from their last REGISTER before seeing a
+			// challenge; ours are single use. Not a wrong password: stale=true tells
+			// the phone to just retry with the new nonce.
+			r.log.Debug("Stale nonce, challenging again", "method", req.Method, "user", username, "source", req.Source())
+			return r.challenge(req, username, true)
 		}
 		reason := "bad credentials"
 		if !r.IsLocalUser(username) {
@@ -163,7 +170,7 @@ func (r *Registrar) Authorize(req *sip.Request, username string) *sip.Response {
 		}
 	}
 
-	return r.challenge(req, username)
+	return r.challenge(req, username, false)
 }
 
 // recordFailure counts one distinct wrong guess against the source IP and reports
@@ -183,7 +190,7 @@ func (r *Registrar) recordFailure(req *sip.Request, guess string) bool {
 // response depends only on the password: that is what lets the auth guard tell
 // "same wrong password again" from "another guess". Replay of a successful
 // response is still blocked because a nonce is deleted on success.
-func (r *Registrar) challenge(req *sip.Request, username string) *sip.Response {
+func (r *Registrar) challenge(req *sip.Request, username string, stale bool) *sip.Response {
 	now := time.Now()
 	key := sourceIP(req) + "|" + username
 
@@ -209,7 +216,7 @@ func (r *Registrar) challenge(req *sip.Request, username string) *sip.Response {
 	}
 	r.mu.Unlock()
 
-	chal := digest.Challenge{Realm: r.realm, Nonce: nonce, Algorithm: "MD5"}
+	chal := digest.Challenge{Realm: r.realm, Nonce: nonce, Algorithm: "MD5", Stale: stale}
 	res := sip.NewResponseFromRequest(req, sip.StatusUnauthorized, "Unauthorized", nil)
 	res.AppendHeader(sip.NewHeader("WWW-Authenticate", chal.String()))
 	return res
@@ -220,16 +227,18 @@ func (r *Registrar) challenge(req *sip.Request, username string) *sip.Response {
 // function of the password alone. The key is empty when the request did not
 // answer a live nonce of ours: whoever sent it never saw our challenge, and
 // counting it would let spoofed UDP packets get a real phone's IP blocked.
-func (r *Registrar) verifyAuth(req *sip.Request, authValue, username string) (bool, string) {
+// stale is true for exactly that case: a well-formed answer to a nonce that is
+// not (or no longer) ours.
+func (r *Registrar) verifyAuth(req *sip.Request, authValue, username string) (ok bool, guess string, stale bool) {
 	cred, err := digest.ParseCredentials(normalizeDigestPrefix(authValue))
 	if err != nil || cred.Username != username || cred.Realm != r.realm {
-		return false, ""
+		return false, "", false
 	}
 	// The response signs the uri= the client chose, so it has to be the Request-URI
 	// (RFC 3261 22.4). Otherwise anyone on the path can take a signed INVITE and
 	// redial it to another number by rewriting the request line alone.
 	if !sameURI(cred.URI, req.Recipient) {
-		return false, ""
+		return false, "", false
 	}
 
 	// Lookup, check and delete under one lock: two copies of the same answer
@@ -237,13 +246,13 @@ func (r *Registrar) verifyAuth(req *sip.Request, authValue, username string) (bo
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	password, known := r.users[username]
-	entry, ok := r.nonces[cred.Nonce]
-	if !ok || entry.user != username || time.Since(entry.created) > nonceLifetime {
-		return false, ""
+	entry, live := r.nonces[cred.Nonce]
+	if !live || entry.user != username || time.Since(entry.created) > nonceLifetime {
+		return false, "", true
 	}
-	guess := username + ":" + cred.Response
+	guess = username + ":" + cred.Response
 	if !known {
-		return false, guess
+		return false, guess, false
 	}
 
 	// Recompute the response with whatever qop/cnonce/nc the client sent.
@@ -260,15 +269,15 @@ func (r *Registrar) verifyAuth(req *sip.Request, authValue, username string) (bo
 		Count:    cred.Nc,
 	})
 	if err != nil {
-		return false, guess
+		return false, guess, false
 	}
 	if subtle.ConstantTimeCompare([]byte(expected.Response), []byte(cred.Response)) != 1 {
-		return false, guess
+		return false, guess, false
 	}
 
 	// Single use: the nonce dies with the successful answer.
 	delete(r.nonces, cred.Nonce)
-	return true, ""
+	return true, "", false
 }
 
 // sameURI reports whether the digest uri= names the same user and host as the

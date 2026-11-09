@@ -72,9 +72,13 @@ func TestAuthorizeDigest(t *testing.T) {
 		t.Fatalf("valid credentials rejected: %v", got)
 	}
 
-	// nonce is single use
-	if got := r.Authorize(req, "100"); got == nil {
+	// nonce is single use; the retry is told it was stale, not wrong
+	got := r.Authorize(req, "100")
+	if got == nil {
 		t.Fatal("replayed credentials accepted")
+	}
+	if chal, err := digest.ParseChallenge(got.GetHeader("WWW-Authenticate").Value()); err != nil || !chal.Stale {
+		t.Fatalf("answer to a used nonce must get stale=true, got %v %v", got.GetHeader("WWW-Authenticate"), err)
 	}
 }
 
