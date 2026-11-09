@@ -3,3 +3,4 @@ config.json
 helpers/*.conf
 recordings/
 .DS_Store
+.venv/

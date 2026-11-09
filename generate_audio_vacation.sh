@@ -2,7 +2,7 @@
 # Generate a Czech vacation announcement that names the day we are back.
 # Usage: ./generate_audio_vacation.sh <back-date YYYY-MM-DD> [output.wav]
 # Default output: vacation_<back-date>.wav
-# Uses tts.sh helper. Requires: pip install gtts, ffmpeg
+# Uses tts.sh helper. Requires: python3 and ffmpeg; gtts goes into tts.sh's own venv
 #
 # Example:
 #   ./generate_audio_vacation.sh 2027-01-04

@@ -189,7 +189,7 @@ An empty or missing `periods` list turns vacation mode off. A malformed date, or
 Use the `tts.sh` helper to generate WAV files from text using Google Translate TTS:
 
 ```bash
-# Requires: pip install gtts, ffmpeg
+# Requires: python3 and ffmpeg; gtts is installed into ./.venv on first run
 ./tts.sh <language> <output.wav> "<text>"
 
 # Examples:

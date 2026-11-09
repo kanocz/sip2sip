@@ -1,6 +1,6 @@
 #!/bin/bash
 # Generate default Czech TTS audio files for sip2sip voicemail.
-# Uses tts.sh helper. Requires: pip install gtts, ffmpeg
+# Uses tts.sh helper. Requires: python3 and ffmpeg; gtts goes into tts.sh's own venv
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

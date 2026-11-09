@@ -1,7 +1,8 @@
 #!/bin/bash
 # Generate a WAV file from text using Google Translate TTS.
 # Usage: ./tts.sh <language> <output.wav> "<text>"
-# Requires: pip install gtts, ffmpeg
+# Requires: python3 and ffmpeg. gtts is installed into .venv next to this
+# script on first run, nothing goes into the system Python.
 #
 # Examples:
 #   ./tts.sh cs unavailable.wav "Dobrý den, momentálně nemůžeme váš hovor přijmout."
@@ -24,12 +25,20 @@ TEXT="$3"
 # Check dependencies
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required"; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || { echo "Error: ffmpeg is required"; exit 1; }
-python3 -c "import gtts" 2>/dev/null || { echo "Error: gtts is required (pip install gtts)"; exit 1; }
+
+# gtts lives in a venv next to the script, created on first run
+VENV="$(cd "$(dirname "$0")" && pwd)/.venv"
+PY="$VENV/bin/python3"
+if ! "$PY" -c "import gtts" 2>/dev/null; then
+    echo "Installing gtts into $VENV"
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install --quiet gtts
+fi
 
 TMPFILE=$(mktemp /tmp/tts-XXXXXX.mp3)
 trap "rm -f '$TMPFILE'" EXIT
 
-python3 -c "
+"$PY" -c "
 from gtts import gTTS
 import sys
 tts = gTTS(sys.argv[1], lang=sys.argv[2])
