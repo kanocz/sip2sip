@@ -23,6 +23,7 @@ type CDR struct {
 	TalkTime     float64   `json:"talk_time_seconds"`   // time after answer
 	Answered        bool    `json:"answered"`
 	Voicemail       bool    `json:"voicemail"`
+	VoicemailReason string  `json:"voicemail_reason,omitempty"`        // "vacation", "outside_hours", "unavailable"
 	MessageDuration float64 `json:"message_duration_seconds,omitempty"` // voicemail message duration (after beep)
 	HangupBy        string  `json:"hangup_by"`                         // "caller", "callee", "timeout", "voicemail"
 	RecordingFile   string  `json:"recording_file,omitempty"`

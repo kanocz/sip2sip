@@ -20,7 +20,7 @@ import (
 
 // handleVoicemail answers the call, plays announcement, and optionally records a voicemail.
 // Recording is done as mono WAV by decoding G.711 directly, avoiding stereo sync issues.
-func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, announcement string, cdr *CDR, log *slog.Logger) {
+func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, reason, announcement string, cdr *CDR, log *slog.Logger) {
 	cfg := h.getConfig()
 
 	// Answer the call
@@ -34,6 +34,7 @@ func (h *CallHandler) handleVoicemail(inDialog *diago.DialogServerSession, annou
 	cdr.AnswerTime = time.Now()
 	cdr.AnsweredBy = "voicemail"
 	cdr.Voicemail = true
+	cdr.VoicemailReason = reason
 
 	// Drain caller's audio during announcement to prevent buffer buildup
 	var drainStop atomic.Bool

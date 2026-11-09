@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -122,10 +123,17 @@ func (h *CallHandler) handleIncoming(inDialog *diago.DialogServerSession, caller
 
 	inDialog.Trying()
 
+	if p := CurrentVacation(&cfg.Vacation, cfg.BusinessHours.Timezone); p != nil {
+		announcement := cmp.Or(p.Announcement, cfg.Vacation.Announcement)
+		log.Info("Vacation mode", "from", p.From, "to", p.To, "announcement", announcement)
+		h.handleVoicemail(inDialog, "vacation", announcement, cdr, log)
+		return
+	}
+
 	// Check business hours
 	if !IsWithinBusinessHours(&cfg.BusinessHours) {
 		log.Info("Outside business hours")
-		h.handleVoicemail(inDialog, cfg.BusinessHours.OutsideHoursAnnouncement, cdr, log)
+		h.handleVoicemail(inDialog, "outside_hours", cfg.BusinessHours.OutsideHoursAnnouncement, cdr, log)
 		return
 	}
 
@@ -133,7 +141,7 @@ func (h *CallHandler) handleIncoming(inDialog *diago.DialogServerSession, caller
 	if len(regs) == 0 {
 		log.Warn("No registered phones")
 		if cfg.Voicemail.UnavailableAnnouncement != "" || cfg.Voicemail.Enabled {
-			h.handleVoicemail(inDialog, cfg.Voicemail.UnavailableAnnouncement, cdr, log)
+			h.handleVoicemail(inDialog, "unavailable", cfg.Voicemail.UnavailableAnnouncement, cdr, log)
 		} else {
 			inDialog.Respond(sip.StatusTemporarilyUnavailable, "No phones registered", nil)
 			cdr.HangupBy = "timeout"

@@ -46,5 +46,11 @@
     "start_time": "10:00",
     "end_time": "17:00",
     "outside_hours_announcement": "./outside_hours.wav"
+  },
+  "vacation": {
+    "announcement": "./vacation.wav",
+    "periods": [
+      { "from": "2026-12-23", "to": "2027-01-03", "announcement": "./vacation_2027-01-04.wav" }
+    ]
   }
 }

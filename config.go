@@ -16,6 +16,7 @@ type Config struct {
 	PostCall      PostCallConfig      `json:"post_call"`
 	Voicemail     VoicemailConfig     `json:"voicemail"`
 	BusinessHours BusinessHoursConfig `json:"business_hours"`
+	Vacation      VacationConfig      `json:"vacation"`
 }
 
 type SIPConfig struct {
@@ -73,6 +74,18 @@ type BusinessHoursConfig struct {
 	OutsideHoursAnnouncement string   `json:"outside_hours_announcement"` // WAV file for outside hours
 }
 
+type VacationConfig struct {
+	Announcement string           `json:"announcement"` // default WAV file played during vacation
+	Periods      []VacationPeriod `json:"periods"`
+}
+
+// VacationPeriod is an inclusive date range in YYYY-MM-DD, in the business_hours timezone.
+type VacationPeriod struct {
+	From         string `json:"from"`
+	To           string `json:"to"`
+	Announcement string `json:"announcement"` // optional, overrides vacation.announcement
+}
+
 func (c *UplinkConfig) ExpiryDuration() time.Duration {
 	if c.Expiry <= 0 {
 		return 300 * time.Second
@@ -117,6 +130,17 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Recording.Enabled && cfg.Recording.Dir == "" {
 		return nil, fmt.Errorf("recording.dir is required when recording is enabled")
+	}
+
+	for i, p := range cfg.Vacation.Periods {
+		from, errFrom := time.Parse(dateLayout, p.From)
+		to, errTo := time.Parse(dateLayout, p.To)
+		if errFrom != nil || errTo != nil {
+			return nil, fmt.Errorf("vacation.periods[%d]: dates must be YYYY-MM-DD", i)
+		}
+		if to.Before(from) {
+			return nil, fmt.Errorf("vacation.periods[%d]: to (%s) is before from (%s)", i, p.To, p.From)
+		}
 	}
 
 	if cfg.SIP.ExternalPort == 0 {

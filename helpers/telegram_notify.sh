@@ -38,11 +38,13 @@ TALK_TIME=$(jq -r '.talk_time_seconds | floor' "$CDR_JSON")
 HANGUP_BY=$(jq -r '.hangup_by' "$CDR_JSON")
 VOICEMAIL=$(jq -r '.voicemail' "$CDR_JSON")
 MSG_DURATION=$(jq -r '.message_duration_seconds // 0 | floor' "$CDR_JSON")
+# Czech label for voicemail_reason; unknown values are shown as is
+REASON=$(jq -r '{vacation: "dovolena", outside_hours: "mimo pracovni dobu", unavailable: "nikdo neni k dispozici"}[.voicemail_reason // ""] // .voicemail_reason // empty' "$CDR_JSON")
 START_TIME=$(jq -r '.start_time | split(".")[0] | gsub("T";" ")' "$CDR_JSON")
 
 # Format human-readable message
 if [ "$VOICEMAIL" = "true" ]; then
-    MSG="Hlasova schranka
+    MSG="Hlasova schranka${REASON:+ (${REASON})}
 Od: ${CALLER}
 Cas: ${START_TIME}
 Delka vzkazu: ${MSG_DURATION}s"

@@ -13,6 +13,7 @@ A minimal SIP B2BUA server written in Go, built on [diago](https://github.com/em
 - **Call recording**: stereo WAV (left channel — one party, right channel — the other)
 - **Recording announcement**: EU-compliant notification played to both parties before recording
 - **Business hours**: accept calls only during configured days and hours
+- **Vacation mode**: send every incoming call to voicemail during configured date ranges
 - **Voicemail**: announcement + beep + recording when no operators available or outside business hours
 - **Hot reload**: `SIGHUP` / `systemctl reload` to apply config changes without restart
 - **Outgoing calls**: short numbers routed internally, longer numbers go through the uplink
@@ -93,7 +94,13 @@ The voicemail flow: answer → play announcement → beep tone → record caller
 
 If `voicemail.enabled` is `false` but an announcement is configured, only the announcement is played (no recording).
 
-The CDR JSON includes `"voicemail": true` and `"message_duration_seconds"` for voicemail calls, so post-call scripts can handle them accordingly.
+The CDR JSON includes `"voicemail": true`, `"voicemail_reason"` and `"message_duration_seconds"` for voicemail calls, so post-call scripts can handle them accordingly. `voicemail_reason` is one of:
+
+| Value | When |
+|---|---|
+| `vacation` | Call came in during a `vacation.periods` range |
+| `outside_hours` | Call came in outside `business_hours` |
+| `unavailable` | No phones were registered |
 
 ### Business hours
 
@@ -107,6 +114,28 @@ The CDR JSON includes `"voicemail": true` and `"message_duration_seconds"` for v
 | `business_hours.outside_hours_announcement` | WAV file played outside business hours | — |
 
 Day names use 3-letter English abbreviations: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`.
+
+### Vacation
+
+| Parameter | Description | Default |
+|---|---|---|
+| `vacation.announcement` | Default WAV file played during vacation | — |
+| `vacation.periods` | Array of `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD", "announcement": "..."}` | `[]` |
+| `vacation.periods[].announcement` | WAV file for this period, overrides `vacation.announcement` | — |
+
+During any period every incoming call skips the phones and goes to voicemail, the same flow as outside business hours. The period's own `announcement` is played if set, `vacation.announcement` otherwise. If periods overlap, the first one listed wins. Both dates are inclusive and use `business_hours.timezone`, even when `business_hours.enabled` is `false`. A message is recorded only if `voicemail.enabled` is `true`.
+
+```json
+"vacation": {
+  "announcement": "./vacation.wav",
+  "periods": [
+    { "from": "2026-12-23", "to": "2027-01-03", "announcement": "./vacation_2027-01-04.wav" },
+    { "from": "2027-08-02", "to": "2027-08-13" }
+  ]
+}
+```
+
+An empty or missing `periods` list turns vacation mode off. A malformed date, or `to` earlier than `from`, fails config loading; on `SIGHUP` the old config stays active.
 
 ## Generating Audio Announcements
 
@@ -127,6 +156,16 @@ Generate the default Czech announcements:
 ```bash
 ./generate_audio.sh
 ```
+
+Generate a vacation announcement that tells callers when they can call again (the first day back, not the last day of vacation):
+
+```bash
+./generate_audio_vacation.sh 2027-01-04
+# -> vacation_2027-01-04.wav: "... Opět vám budeme k dispozici od čtvrtého ledna. ..."
+./generate_audio_vacation.sh 2027-01-04 /opt/sip2sip/xmas.wav   # custom output path
+```
+
+Use the file as `announcement` of the matching period in `vacation.periods`.
 
 ## Port Forwarding (NAT)
 
@@ -154,7 +193,7 @@ Set `sip.external_ip` to your public IP.
 ```bash
 # Copy files
 sudo mkdir -p /opt/sip2sip/recordings
-sudo cp sip2sip announcement.wav unavailable.wav outside_hours.wav /opt/sip2sip/
+sudo cp sip2sip announcement.wav unavailable.wav outside_hours.wav vacation.wav /opt/sip2sip/
 sudo cp config.example.json /opt/sip2sip/config.json
 sudo nano /opt/sip2sip/config.json  # edit config
 
@@ -167,7 +206,7 @@ sudo systemctl enable --now sip2sip
 sudo systemctl status sip2sip
 sudo journalctl -u sip2sip -f
 
-# Reload config without restart (applies users, voicemail, business hours, recording, dialplan)
+# Reload config without restart (applies users, voicemail, business hours, vacation, recording, dialplan)
 sudo systemctl reload sip2sip
 ```
 
@@ -179,6 +218,7 @@ Sending `SIGHUP` (or `systemctl reload sip2sip`) reloads the configuration file 
 - Recording settings
 - Voicemail settings
 - Business hours schedule
+- Vacation periods
 - Dialplan
 - Uplink call filters
 
@@ -199,11 +239,12 @@ Both filters are independent and can be combined.
 
 1. sip2sip registers on the uplink SIP server
 2. Incoming INVITE is checked against configured filters
-3. Business hours are checked (if enabled) — outside hours → voicemail with `outside_hours_announcement`
-4. Registered phones are checked — if none connected → voicemail with `unavailable_announcement`
-5. All registered local phones ring simultaneously
-6. The first phone to answer gets the call
-7. Symmetric RTP (NAT traversal) is enabled — mobile clients behind carrier NAT work correctly
+3. Vacation periods are checked: during a period → voicemail with `vacation.announcement`
+4. Business hours are checked (if enabled) — outside hours → voicemail with `outside_hours_announcement`
+5. Registered phones are checked — if none connected → voicemail with `unavailable_announcement`
+6. All registered local phones ring simultaneously
+7. The first phone to answer gets the call
+8. Symmetric RTP (NAT traversal) is enabled — mobile clients behind carrier NAT work correctly
 
 **Normal mode** (`answer_first: false`):
 - Caller hears ringback from the uplink while phones ring
@@ -272,6 +313,7 @@ Voicemail:
   "talk_time_seconds": 34,
   "answered": true,
   "voicemail": true,
+  "voicemail_reason": "outside_hours",
   "message_duration_seconds": 12.5,
   "hangup_by": "voicemail",
   "recording_file": "/opt/sip2sip/recordings/vm_20260328_183000_b2c3d4e5.wav"
